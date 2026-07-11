@@ -1,0 +1,4302 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import random
+import sys
+import time
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(_env_path)
+except ImportError:
+    pass
+
+import aiosqlite
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("rpg_bot")
+
+# ═══════════════════════════════════════════════════════════════════════
+# 설정 / 공용 도우미
+# ═══════════════════════════════════════════════════════════════════════
+@dataclass
+class Settings:
+    @property
+    def token(self) -> str:
+        return os.getenv("DISCORD_TOKEN", "TOKEN_HERE")
+
+    @property
+    def database_path(self) -> str:
+        return os.getenv("RPG_DB_PATH", "discord_rpg.sqlite3")
+
+    @property
+    def dev_ids(self) -> List[int]:
+        ids = os.getenv("DEV_IDS", "")
+        return [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+
+    @property
+    def bug_channel_id(self) -> Optional[int]:
+        v = os.getenv("BUG_CHANNEL_ID", "")
+        return int(v) if v.isdigit() else None
+
+    @property
+    def announce_channel_ids(self) -> List[int]:
+        ids = os.getenv("ANNOUNCE_CHANNEL_IDS", "")
+        return [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+
+    world_width: int = int(os.getenv("WORLD_WIDTH", "200"))
+    world_height: int = int(os.getenv("WORLD_HEIGHT", "200"))
+    trade_tax_percent: int = 5
+    season_number: int = 1
+
+settings = Settings()
+WORLD_W, WORLD_H = settings.world_width, settings.world_height
+
+_cooldowns: Dict[str, Dict[int, float]] = defaultdict(dict)
+
+def check_cooldown(cmd_key: str, uid: int, seconds: float) -> Optional[float]:
+    now = time.time()
+    last = _cooldowns[cmd_key].get(uid, 0)
+    remain = seconds - (now - last)
+    if remain > 0:
+        return remain
+    _cooldowns[cmd_key][uid] = now
+    return None
+
+DB_PATH = Path(settings.database_path)
+_db_conn: Optional[aiosqlite.Connection] = None
+_db_lock = asyncio.Lock()
+
+async def _get_conn():
+    global _db_conn
+    if _db_conn is None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _db_conn = await aiosqlite.connect(DB_PATH, timeout=30)
+        _db_conn.row_factory = aiosqlite.Row
+        await _db_conn.execute("PRAGMA journal_mode=WAL;")
+        await _db_conn.commit()
+    return _db_conn
+
+async def execute(query, params=()):
+    async with _db_lock:
+        db = await _get_conn()
+        await db.execute(query, tuple(params))
+        await db.commit()
+
+async def execute_insert(query, params=()):
+    async with _db_lock:
+        db = await _get_conn()
+        cur = await db.execute(query, tuple(params))
+        await db.commit()
+        return cur.lastrowid
+
+async def fetch_one(query, params=()):
+    async with _db_lock:
+        db = await _get_conn()
+        cur = await db.execute(query, tuple(params))
+        return await cur.fetchone()
+
+async def fetch_all(query, params=()):
+    async with _db_lock:
+        db = await _get_conn()
+        cur = await db.execute(query, tuple(params))
+        return await cur.fetchall()
+
+def j(d):
+    return json.dumps(d, ensure_ascii=False)
+
+def uj(s):
+    if not s:
+        return {}
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+async def init_db():
+    async with _db_lock:
+        db = await _get_conn()
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS players (
+                user_id INTEGER PRIMARY KEY, username TEXT, guild_id TEXT,
+                job TEXT DEFAULT '초보자', title TEXT DEFAULT '',
+                x INTEGER DEFAULT 100, y INTEGER DEFAULT 100,
+                hp INTEGER DEFAULT 150, max_hp INTEGER DEFAULT 150,
+                mp INTEGER DEFAULT 50, max_mp INTEGER DEFAULT 50,
+                stamina INTEGER DEFAULT 100, max_stamina INTEGER DEFAULT 100,
+                level INTEGER DEFAULT 1, exp INTEGER DEFAULT 0,
+                coins INTEGER DEFAULT 1000, gems INTEGER DEFAULT 10,
+                attack INTEGER DEFAULT 10, defense INTEGER DEFAULT 5,
+                crit INTEGER DEFAULT 5, facing TEXT DEFAULT 'S',
+                biome TEXT DEFAULT '평원',
+                equipment_json TEXT DEFAULT '{}',
+                state_json TEXT DEFAULT '{}',
+                appearance_json TEXT DEFAULT '{}',
+                achievements_json TEXT DEFAULT '[]',
+                tutorial_step INTEGER DEFAULT 0,
+                season_bp_level INTEGER DEFAULT 0,
+                season_bp_exp INTEGER DEFAULT 0,
+                partner_id INTEGER DEFAULT 0,
+                brother_id INTEGER DEFAULT 0,
+                invite_code TEXT DEFAULT '',
+                invited_by INTEGER DEFAULT 0,
+                voice_bonus_until TEXT DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS inventory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, item_code TEXT, item_name TEXT,
+                item_type TEXT, rarity TEXT, qty INTEGER DEFAULT 1,
+                power INTEGER DEFAULT 0, defense INTEGER DEFAULT 0,
+                enchant_level INTEGER DEFAULT 0, meta_json TEXT DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS world_tiles (
+                x INTEGER, y INTEGER, tile_type TEXT,
+                PRIMARY KEY(x,y)
+            );
+            CREATE TABLE IF NOT EXISTS guilds (
+                guild_name TEXT PRIMARY KEY, owner_id INTEGER,
+                treasury INTEGER DEFAULT 0, notice TEXT DEFAULT '',
+                members_json TEXT DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS battle_sessions (
+                battle_id TEXT PRIMARY KEY,
+                challenger_id INTEGER,
+                target_id INTEGER DEFAULT 0,
+                session_type TEXT DEFAULT 'dungeon',
+                state_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS auction_house (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id INTEGER, item_json TEXT,
+                min_bid INTEGER DEFAULT 0, current_bid INTEGER DEFAULT 0,
+                highest_bidder INTEGER DEFAULT 0,
+                end_at TEXT, watch_list_json TEXT DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS raid_sessions (
+                raid_id TEXT PRIMARY KEY,
+                boss_name TEXT, boss_hp INTEGER, boss_max_hp INTEGER,
+                participants_json TEXT DEFAULT '{}',
+                state TEXT DEFAULT 'active',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS quests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, quest_code TEXT,
+                progress INTEGER DEFAULT 0, completed INTEGER DEFAULT 0,
+                accepted_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS fishing_contest (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, score INTEGER DEFAULT 0,
+                season_week TEXT
+            );
+            CREATE TABLE IF NOT EXISTS rankings (
+                user_id INTEGER, category TEXT, score INTEGER DEFAULT 0,
+                season TEXT DEFAULT 'global',
+                PRIMARY KEY(user_id, category, season)
+            );
+            CREATE TABLE IF NOT EXISTS houses (
+                x INTEGER, y INTEGER, owner_id INTEGER,
+                furniture_json TEXT DEFAULT '[]',
+                PRIMARY KEY(x, y)
+            );
+            CREATE TABLE IF NOT EXISTS marriages (
+                user_id INTEGER PRIMARY KEY,
+                partner_id INTEGER, married_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS error_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT, error_text TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS battlepass (
+                user_id INTEGER PRIMARY KEY,
+                season INTEGER DEFAULT 1,
+                premium INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 0,
+                exp INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS global_chat_channels (
+                guild_id TEXT PRIMARY KEY,
+                channel_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS player_settings (
+                user_id INTEGER PRIMARY KEY,
+                auto_refresh INTEGER DEFAULT 0,
+                theme TEXT DEFAULT 'default'
+            );
+            CREATE TABLE IF NOT EXISTS guild_wars (
+                war_id TEXT PRIMARY KEY,
+                guild_a TEXT, guild_b TEXT,
+                score_a INTEGER DEFAULT 0, score_b INTEGER DEFAULT 0,
+                state TEXT DEFAULT 'active',
+                ends_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS crafting_recipes (
+                recipe_id TEXT PRIMARY KEY,
+                recipe_name TEXT, recipe_type TEXT,
+                materials_json TEXT, result_item TEXT,
+                result_qty INTEGER DEFAULT 1,
+                level_req INTEGER DEFAULT 1,
+                exp_reward INTEGER DEFAULT 100,
+                coins_cost INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS player_crafting (
+                user_id INTEGER, recipe_id TEXT,
+                times_crafted INTEGER DEFAULT 0,
+                last_crafted_at TEXT,
+                PRIMARY KEY(user_id, recipe_id)
+            );
+            CREATE TABLE IF NOT EXISTS player_skills (
+                user_id INTEGER, skill_id TEXT,
+                skill_level INTEGER DEFAULT 1,
+                last_used_at TEXT,
+                PRIMARY KEY(user_id, skill_id)
+            );
+            CREATE TABLE IF NOT EXISTS world_bosses (
+                boss_id TEXT PRIMARY KEY,
+                boss_name TEXT, boss_hp INTEGER, boss_max_hp INTEGER,
+                participants_json TEXT DEFAULT '[]',
+                boss_attack INTEGER DEFAULT 20,
+                boss_defense INTEGER DEFAULT 10,
+                loot_table_json TEXT DEFAULT '[]',
+                respawn_time TEXT,
+                state TEXT DEFAULT 'dormant'
+            );
+            CREATE TABLE IF NOT EXISTS player_world_boss_kills (
+                user_id INTEGER, boss_id TEXT,
+                kill_count INTEGER DEFAULT 0,
+                last_killed_at TEXT,
+                PRIMARY KEY(user_id, boss_id)
+            );
+            """
+        )
+        await db.commit()
+        # 기존 DB(구버전)에는 아래 컬럼들이 없을 수 있으므로 안전하게 추가 마이그레이션합니다.
+        for alter_sql in (
+            "ALTER TABLE players ADD COLUMN skill_points INTEGER DEFAULT 0",
+            "ALTER TABLE players ADD COLUMN traits_json TEXT DEFAULT '{}'",
+            "ALTER TABLE players ADD COLUMN crafting_exp INTEGER DEFAULT 0",
+            "ALTER TABLE raid_sessions ADD COLUMN is_world INTEGER DEFAULT 0",
+            "ALTER TABLE guilds ADD COLUMN war_wins INTEGER DEFAULT 0",
+        ):
+            try:
+                await db.execute(alter_sql)
+            except Exception:
+                pass
+        await db.commit()
+
+# ═══════════════════════════════════════════════════════════════════════
+# 데이터 카탈로그
+# ═══════════════════════════════════════════════════════════════════════
+@dataclass(slots=True)
+class Item:
+    code: str
+    name: str
+    item_type: str
+    rarity: str
+    power: int = 0
+    defense: int = 0
+    meta: dict = field(default_factory=dict)
+
+ITEM_CATALOG: Dict[str, Item] = {}
+RARITIES = ["일반", "희귀", "영웅", "전설", "신화", "초월"]
+WEAPON_TYPES = ["검", "활", "지팡이", "단검", "둔기", "창"]
+ARMOR_TYPES = ["갑옷", "투구", "장갑", "신발"]
+RARITY_EMOJI = {"일반":"⚪","희귀":"🔵","영웅":"🟣","전설":"🟡","신화":"🔴","초월":"🌈"}
+
+
+def _build_items():
+    mats = ["나무","돌","철","금","다이아몬드","미스릴","오리할콘","드래곤하트","마나수정","고대유물"]
+    for m in mats:
+        ITEM_CATALOG[f"mat_{m}"] = Item(f"mat_{m}", f"📦 {m}", "재료", "일반")
+
+    consumables = [
+        ("potion_hp_s","🧪 소형 HP 포션","소비","일반",0,0,{"heal":50}),
+        ("potion_hp_m","🧪 중형 HP 포션","소비","희귀",0,0,{"heal":150}),
+        ("potion_hp_l","🧪 대형 HP 포션","소비","영웅",0,0,{"heal":400}),
+        ("potion_mp_s","💧 소형 MP 포션","소비","일반",0,0,{"mp_restore":30}),
+        ("potion_mp_m","💧 중형 MP 포션","소비","희귀",0,0,{"mp_restore":100}),
+        ("scroll_teleport","📜 귀환 스크롤","소비","일반",0,0,{"teleport":"town"}),
+        ("scroll_dungeon","📜 던전 스크롤","소비","희귀",0,0,{"teleport":"dungeon"}),
+        ("fishing_rod","🎣 낚싯대","도구","일반",0,0,{}),
+        ("fishing_rod_gold","🎣 황금 낚싯대","도구","전설",0,0,{"bonus":2}),
+        ("invite_token","🎟️ 초대 토큰","소비","일반",0,0,{}),
+        ("event_ticket","🎫 이벤트 티켓","소비","희귀",0,0,{}),
+    ]
+    for c in consumables:
+        ITEM_CATALOG[c[0]] = Item(c[0], c[1], c[2], c[3], c[4], c[5], c[6])
+
+    for t_idx, t in enumerate(WEAPON_TYPES):
+        for lv in range(1, 51):
+            for r_idx, r in enumerate(RARITIES):
+                code = f"w_{t_idx}_{lv}_{r_idx}"
+                ITEM_CATALOG[code] = Item(code, f"{RARITY_EMOJI[r]} {r} {t} Lv.{lv}", "무기", r, power=lv * 10 + r_idx * 25)
+
+    for t_idx, t in enumerate(ARMOR_TYPES):
+        for lv in range(1, 51):
+            for r_idx, r in enumerate(RARITIES):
+                code = f"a_{t_idx}_{lv}_{r_idx}"
+                ITEM_CATALOG[code] = Item(code, f"{RARITY_EMOJI[r]} {r} {t} Lv.{lv}", "방어구", r, defense=lv * 5 + r_idx * 15)
+
+    craft_items = [
+        ("craft_fire_sword","🔥 화염검","무기","영웅",300,0,{"element":"fire"}),
+        ("craft_ice_bow","❄️ 빙결활","무기","영웅",280,0,{"element":"ice"}),
+        ("craft_thunder_staff","⚡ 번개 지팡이","무기","전설",500,0,{"element":"thunder"}),
+        ("craft_dragon_armor","🐉 드래곤 갑옷","방어구","전설",0,400,{"element":"dragon","slot":"body"}),
+        ("craft_shadow_cloak","🌑 그림자 망토","방어구","신화",0,600,{"element":"dark","slot":"body"}),
+        ("craft_holy_shield","✨ 성스러운 방패","방어구","신화",50,700,{"element":"holy","slot":"body"}),
+        ("dev_god_armor","👑 신의 갑옷","방어구","초월",0,9999999,{"dev":True, "hp_inf":True,"slot":"body"}),
+    ]
+    for c in craft_items:
+        ITEM_CATALOG[c[0]] = Item(c[0], c[1], c[2], c[3], c[4], c[5], c[6])
+
+    # 세트 장비 (제작 전용) - 무기+투구+갑옷+장갑+신발 5부위를 맞춰입으면 세트효과 발동
+    set_defs = [
+        ("dragon", "🐉 용맹", "전설", {"weapon":260,"head":0,"body":0,"gloves":0,"boots":0}, {"weapon":0,"head":140,"body":220,"gloves":90,"boots":90}),
+        ("shadow", "🌑 암영", "신화", {"weapon":320,"head":0,"body":0,"gloves":0,"boots":0}, {"weapon":0,"head":170,"body":260,"gloves":110,"boots":110}),
+        ("holy", "✨ 천상", "신화", {"weapon":300,"head":0,"body":0,"gloves":0,"boots":0}, {"weapon":0,"head":180,"body":280,"gloves":100,"boots":100}),
+    ]
+    slot_kor = {"weapon":"무기","head":"투구","body":"갑옷","gloves":"장갑","boots":"신발"}
+    for set_code, set_label, rarity, pw, df in set_defs:
+        for slot in ["weapon","head","body","gloves","boots"]:
+            code = f"set_{set_code}_{slot}"
+            item_type = "무기" if slot == "weapon" else "방어구"
+            ITEM_CATALOG[code] = Item(
+                code, f"{set_label} {slot_kor[slot]}", item_type, rarity,
+                power=pw[slot], defense=df[slot], meta={"set": set_code, "slot": slot},
+            )
+
+_build_items()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 🎮 MEGA RPG SYSTEM - 50가지 완전한 기능 통합
+# ═══════════════════════════════════════════════════════════════════════
+
+# 1-5. 캐릭터 빌드 시스템
+JOB_CLASSES = {
+    "전사": {"str": 15, "agi": 8, "int": 5, "vit": 13, "lck": 4, "hp_mult": 1.2},
+    "마법사": {"str": 5, "agi": 10, "int": 16, "vit": 8, "lck": 6, "mp_mult": 1.5},
+    "도적": {"str": 11, "agi": 16, "int": 8, "vit": 9, "lck": 11, "crit_mult": 1.3},
+    "성직자": {"str": 9, "agi": 8, "int": 12, "vit": 14, "lck": 12, "heal_mult": 1.3},
+}
+
+TRANSCEND_JOBS = {
+    "전사": {"lv": 20, "next": "검사", "bonus": {"str": 5, "vit": 3, "hp": 100}},
+    "마법사": {"lv": 20, "next": "마도사", "bonus": {"int": 5, "agi": 2, "mp": 50}},
+    "도적": {"lv": 20, "next": "암살자", "bonus": {"agi": 6, "str": 2, "crit": 15}},
+    "성직자": {"lv": 20, "next": "주교", "bonus": {"int": 4, "vit": 4, "heal": 30}},
+}
+
+TRAITS = {
+    "t001": {"name": "치명타 강화", "crit": 10},
+    "t002": {"name": "회복 강화", "heal": 15},
+    "t003": {"name": "채집 속도", "gathering": 20},
+    "t004": {"name": "경험치 획득 증가", "exp": 10},
+    "t005": {"name": "골드 획득 증가", "gold": 15},
+}
+
+SKILL_TREE = {
+    "전사": {
+        "s001": {"name": "파워 스트라이크", "mp": 10, "mult": 1.5, "lv": 1},
+        "s002": {"name": "방어 자세", "mp": 5, "def_boost": 0.3, "lv": 5},
+        "s003": {"name": "회전 베기", "mp": 15, "mult": 1.8, "lv": 10},
+        "s004": {"name": "무상의 일격", "mp": 30, "mult": 3.0, "lv": 20},
+    },
+    "마법사": {
+        "s101": {"name": "파이어볼", "mp": 15, "mult": 1.8, "attr": "fire", "lv": 1},
+        "s102": {"name": "프로스트 암호", "mp": 20, "mult": 2.0, "attr": "water", "lv": 8},
+        "s103": {"name": "메테오", "mp": 40, "mult": 3.5, "attr": "neutral", "lv": 15},
+        "s104": {"name": "마나 쉴드", "mp": 25, "def_boost": 0.5, "lv": 20},
+    },
+    "도적": {
+        "s201": {"name": "백스탭", "mp": 10, "mult": 2.0, "lv": 1},
+        "s202": {"name": "연막탄", "mp": 12, "evasion": 0.5, "lv": 6},
+        "s203": {"name": "그림자 베기", "mp": 20, "mult": 2.5, "lv": 12},
+        "s204": {"name": "암살", "mp": 30, "mult": 4.0, "lv": 18},
+    },
+    "성직자": {
+        "s301": {"name": "힐", "mp": 15, "heal": 80, "lv": 1},
+        "s302": {"name": "축복", "mp": 10, "stat_boost": 0.2, "lv": 5},
+        "s303": {"name": "대힐", "mp": 30, "heal": 200, "lv": 10},
+        "s304": {"name": "부활", "mp": 50, "revive": True, "lv": 20},
+    },
+}
+
+EQUIPMENT_GRADES = {
+    "일반": {"mult": 1.0, "emoji": "⚪", "color": "gray"},
+    "고급": {"mult": 1.2, "emoji": "🟢", "color": "green"},
+    "희귀": {"mult": 1.5, "emoji": "🔵", "color": "blue"},
+    "영웅": {"mult": 2.0, "emoji": "🟣", "color": "purple"},
+    "전설": {"mult": 2.5, "emoji": "🟡", "color": "gold"},
+}
+
+# 6-9. 전투 시스템
+ATTRIBUTES = {
+    "neutral": "무속성", "fire": "🔥불", "water": "💧물", "wind": "💨바람", "earth": "🪨흙"
+}
+
+ATTRIBUTE_WEAKNESS = {
+    "fire": {"weak": "water", "resist": "earth"},
+    "water": {"weak": "wind", "resist": "fire"},
+    "wind": {"weak": "earth", "resist": "water"},
+    "earth": {"weak": "fire", "resist": "wind"},
+}
+
+STATUS_EFFECTS = {
+    "poison": {"name": "중독", "emoji": "☠️", "dmg": 5, "dur": 3},
+    "burn": {"name": "화상", "emoji": "🔥", "dmg": 8, "dur": 2},
+    "freeze": {"name": "빙결", "emoji": "🧊", "evasion": -0.3, "dur": 2},
+    "stun": {"name": "기절", "emoji": "⭐", "skip": True, "dur": 1},
+    "bleed": {"name": "출혈", "emoji": "🩸", "dmg": 10, "dur": 4},
+}
+
+COMBO_SKILLS = {
+    "c001": {"skills": ["s001", "s002"], "bonus": 1.5, "name": "연계 공격"},
+    "c002": {"skills": ["s101", "s102"], "bonus": 1.8, "name": "원소 폭발"},
+}
+
+ULTIMATE_SKILLS = {
+    "u001": {"name": "최후의 일격", "cost": 100, "mult": 5.0},
+    "u002": {"name": "광역 마법", "cost": 100, "mult": 4.5},
+}
+
+# 10-18. 콘텐츠 시스템
+ZONES = {
+    "z001": {"name": "초원", "level": 1, "mobs": ["초급몬스터"], "rewards": 100},
+    "z002": {"name": "동굴", "level": 10, "mobs": ["오우거"], "rewards": 500},
+    "z003": {"name": "사막", "level": 20, "mobs": ["스핑크스"], "rewards": 1000},
+    "z004": {"name": "설원", "level": 30, "mobs": ["얼음거인"], "rewards": 2000},
+    "z005": {"name": "지옥", "level": 50, "mobs": ["데몬로드"], "rewards": 5000},
+}
+
+DUNGEONS = {
+    "d001": {"name": "습격당한 마을", "lv": 5, "boss": "검은기사", "reward": 1000},
+    "d002": {"name": "금지된 숲", "lv": 15, "boss": "드래곤", "reward": 5000},
+    "d003": {"name": "용의 소굴", "lv": 30, "boss": "고룡", "reward": 15000},
+}
+
+INFINITE_TOWER = {
+    "stage": 1,
+    "max_stage": 100,
+    "reward_mult": 1.1,
+    "difficulty_mult": 1.2,
+}
+
+WORLD_BOSSES = {
+    "wb001": {"name": "대재앙 이프리트", "hp": 100000, "atk": 500, "reward": 50000},
+    "wb002": {"name": "심연의 리바이어던", "hp": 150000, "atk": 600, "reward": 80000},
+    "wb003": {"name": "뇌신 라이오넬", "hp": 200000, "atk": 700, "reward": 120000},
+}
+
+DAILY_DUNGEONS = {
+    "0": {"name": "월요일 던전", "element": "fire"},
+    "1": {"name": "화요일 던전", "element": "water"},
+    "2": {"name": "수요일 던전", "element": "wind"},
+    "3": {"name": "목요일 던전", "element": "earth"},
+    "4": {"name": "금요일 던전", "element": "neutral"},
+}
+
+# 19-22. 퀘스트 시스템
+QUESTS = {
+    "main001": {"type": "main", "name": "모험 시작", "reward": 1000, "next": "main002"},
+    "sub001": {"type": "sub", "name": "몬스터 사냥", "reward": 500},
+    "repeat001": {"type": "repeat", "name": "일일 사냥", "reward": 100},
+}
+
+NPC_FAVORABILITY = {
+    "npc001": {"name": "상인", "favor": 0, "reward_unlock_lv": 10},
+    "npc002": {"name": "대장장이", "favor": 0, "reward_unlock_lv": 20},
+}
+
+# 23-27. 경제 시스템
+CURRENCIES = {
+    "gold": "골드 💰",
+    "honor": "명예 점수 🎖️",
+    "token": "레이드 토큰 🎫",
+    "event": "이벤트 코인 🪙",
+}
+
+SHOP_ITEMS = {
+    "potion_hp": {"name": "HP 포션", "price": 100, "desc": "HP 50 회복"},
+    "potion_mp": {"name": "MP 포션", "price": 150, "desc": "MP 30 회복"},
+    "scroll_exp": {"name": "경험치 스크롤", "price": 500, "desc": "경험치 10% 부스트"},
+}
+
+COLLECTION_ITEMS = {
+    "c001": "용의 심장",
+    "c002": "신비한 수정",
+    "c003": "천상의 깃털",
+    "c004": "심연의 영혼",
+    "c005": "시간의 모래",
+}
+
+# 28-32. 생활 시스템
+CRAFTING_RECIPES = {
+    "craft_sword": {"materials": {"iron": 10, "stone": 5}, "cost": 1000, "result": "검"},
+    "craft_armor": {"materials": {"copper": 15, "leather": 10}, "cost": 2000, "result": "갑옷"},
+    "craft_potion": {"materials": {"herb": 5, "water": 3}, "cost": 500, "result": "포션"},
+}
+
+GATHERING = {
+    "herb": {"name": "약초", "lv": 1, "reward": 10},
+    "ore": {"name": "광석", "lv": 10, "reward": 50},
+    "fish": {"name": "물고기", "lv": 5, "reward": 30},
+}
+
+COOKING = {
+    "food_hp": {"ingredients": ["meat", "herb"], "effect": "HP 회복 150", "duration": 10},
+    "food_atk": {"ingredients": ["meat", "spice"], "effect": "공격력 20% 증가", "duration": 10},
+}
+
+PETS = {
+    "pet001": {"name": "거대 늑대", "atk": 50, "evolve_lv": 30},
+    "pet002": {"name": "불사조", "heal": 50, "evolve_lv": 40},
+}
+
+FACILITY = {
+    "farm": {"name": "농장", "production": "crop", "cycle": 300},
+    "workshop": {"name": "공방", "production": "tool", "cycle": 600},
+}
+
+# 33-37. 커뮤니티
+GUILD_SYSTEM = {
+    "leader_bonus": 0.1,
+    "member_limit": 50,
+    "fund_tax": 0.05,
+}
+
+ACHIEVEMENT_TITLES = {
+    "ach001": {"name": "초급 모험가", "condition": "Lv.10 도달"},
+    "ach002": {"name": "몬스터 사냥꾼", "condition": "몬스터 100마리 처치"},
+    "ach003": {"name": "무한의 탑 정복자", "condition": "무한의 탑 50층 도달"},
+    "ach004": {"name": "부자", "condition": "골드 1,000,000 보유"},
+    "ach005": {"name": "수집가", "condition": "모든 수집품 완성"},
+}
+
+CRAFT_RECIPES = {
+    "craft_fire_sword": {"재료": {"mat_철":10, "mat_드래곤하트":2}, "코인":5000},
+    "craft_ice_bow":    {"재료": {"mat_미스릴":10, "mat_마나수정":3}, "코인":5000},
+    "craft_thunder_staff": {"재료": {"mat_오리할콘":10, "mat_마나수정":5}, "코인":10000},
+    "craft_dragon_armor": {"재료": {"mat_드래곤하트":10, "mat_철":20}, "코인":15000},
+    "craft_shadow_cloak": {"재료": {"mat_고대유물":10, "mat_미스릴":15}, "코인":20000},
+    "craft_holy_shield": {"재료": {"mat_마나수정":20, "mat_오리할콘":10}, "코인":25000},
+    "potion_hp_m": {"재료": {"mat_나무":5, "mat_돌":5}, "코인":500},
+    "potion_hp_l": {"재료": {"mat_철":5, "mat_금":2}, "코인":2000},
+    "fishing_rod_gold": {"재료": {"mat_금":10, "mat_다이아몬드":2}, "코인":10000},
+    # 세트 장비 제작 레시피
+    "set_dragon_weapon": {"재료": {"mat_드래곤하트":6, "mat_미스릴":8}, "코인":12000},
+    "set_dragon_head":   {"재료": {"mat_드래곤하트":4, "mat_철":10}, "코인":8000},
+    "set_dragon_body":   {"재료": {"mat_드래곤하트":8, "mat_철":15}, "코인":16000},
+    "set_dragon_gloves": {"재료": {"mat_드래곤하트":3, "mat_철":8}, "코인":6000},
+    "set_dragon_boots":  {"재료": {"mat_드래곤하트":3, "mat_철":8}, "코인":6000},
+    "set_shadow_weapon": {"재료": {"mat_고대유물":6, "mat_미스릴":10}, "코인":15000},
+    "set_shadow_head":   {"재료": {"mat_고대유물":4, "mat_미스릴":6}, "코인":10000},
+    "set_shadow_body":   {"재료": {"mat_고대유물":8, "mat_미스릴":12}, "코인":20000},
+    "set_shadow_gloves": {"재료": {"mat_고대유물":3, "mat_미스릴":5}, "코인":8000},
+    "set_shadow_boots":  {"재료": {"mat_고대유물":3, "mat_미스릴":5}, "코인":8000},
+    "set_holy_weapon":   {"재료": {"mat_마나수정":8, "mat_오리할콘":6}, "코인":14000},
+    "set_holy_head":     {"재료": {"mat_마나수정":5, "mat_오리할콘":4}, "코인":9000},
+    "set_holy_body":     {"재료": {"mat_마나수정":10, "mat_오리할콘":8}, "코인":18000},
+    "set_holy_gloves":   {"재료": {"mat_마나수정":4, "mat_오리할콘":3}, "코인":7000},
+    "set_holy_boots":    {"재료": {"mat_마나수정":4, "mat_오리할콘":3}, "코인":7000},
+}
+
+# 아이템 세트효과: 같은 세트를 여러 부위 맞춰 입으면 추가 스탯 보너스 (부위 수는 비누적, 최고 단계만 적용)
+ITEM_SETS = {
+    "dragon": {
+        "name": "🐉 용맹 세트",
+        "bonus": {
+            2: {"attack": 15, "defense": 10},
+            4: {"attack": 35, "defense": 25},
+            5: {"attack": 60, "defense": 45, "max_hp": 150, "desc": "용의 가호: 전 스탯 대폭 강화"},
+        },
+    },
+    "shadow": {
+        "name": "🌑 암영 세트",
+        "bonus": {
+            2: {"attack": 20, "crit": 5},
+            4: {"attack": 45, "crit": 10},
+            5: {"attack": 75, "crit": 18, "defense": 30, "desc": "그림자의 계약: 치명타 대폭 강화"},
+        },
+    },
+    "holy": {
+        "name": "✨ 천상 세트",
+        "bonus": {
+            2: {"defense": 20, "max_hp": 60},
+            4: {"defense": 45, "max_hp": 150},
+            5: {"defense": 70, "max_hp": 300, "max_mp": 100, "desc": "천상의 축복: 방어와 생명력 극대화"},
+        },
+    },
+}
+ARMOR_SLOT_BY_INDEX = {0: "body", 1: "head", 2: "gloves", 3: "boots"}
+
+# 특성(패시브) 트리: 레벨업 시 특성 포인트를 얻어 자유롭게 투자하는 영구 강화
+TRAITS = {
+    "trait_power":     {"name": "💪 힘의 단련", "desc": "공격력 +3 / 포인트", "stat": "attack", "per_point": 3, "max": 15},
+    "trait_iron":      {"name": "🛡️ 강철 피부", "desc": "방어력 +2 / 포인트", "stat": "defense", "per_point": 2, "max": 15},
+    "trait_precision": {"name": "🎯 정밀함", "desc": "치명타 +1% / 포인트", "stat": "crit", "per_point": 1, "max": 15},
+    "trait_vitality":  {"name": "❤️ 활력", "desc": "최대 HP +15 / 포인트", "stat": "max_hp", "per_point": 15, "max": 15},
+    "trait_focus":     {"name": "💧 집중", "desc": "최대 MP +10 / 포인트", "stat": "max_mp", "per_point": 10, "max": 15},
+}
+
+SKILL_TREE = {
+    "전사": {
+        "power_strike": {"name":"💥 파워 스트라이크","mp":10,"mult":2.0,"desc":"강력한 일격"},
+        "shield_bash": {"name":"🛡️ 쉴드 배쉬","mp":15,"mult":1.5,"stun":True,"desc":"기절 유발"},
+        "berserk": {"name":"😤 광전사","mp":20,"mult":3.0,"desc":"HP 30% 이하 시 3배 데미지"},
+        "war_cry": {"name":"📣 전투 함성","mp":25,"mult":1.0,"team_atk":1.3,"desc":"파티 공격력 30% 증가"},
+    },
+    "궁수": {
+        "double_shot": {"name":"🏹 더블 샷","mp":12,"mult":2.2,"desc":"두 번 공격"},
+        "poison_arrow": {"name":"🧪 독 화살","mp":18,"mult":1.8,"dot":True,"desc":"독 데미지 지속"},
+        "eagle_eye": {"name":"🦅 독수리 눈","mp":15,"mult":2.5,"crit_boost":30,"desc":"치명타율 30% 증가"},
+        "rain_of_arrows": {"name":"🌧️ 화살비","mp":30,"mult":1.5,"aoe":True,"desc":"전체 공격"},
+    },
+    "마법사": {
+        "fireball": {"name":"🔥 파이어볼","mp":20,"mult":3.0,"desc":"강력한 화염 공격"},
+        "mana_shield": {"name":"🌀 마나 쉴드","mp":25,"def_boost":50,"desc":"방어력 50 증가"},
+        "blizzard": {"name":"❄️ 블리자드","mp":35,"mult":2.5,"slow":True,"desc":"광역 빙결"},
+        "meteor": {"name":"☄️ 메테오","mp":50,"mult":5.0,"desc":"최강 마법 공격"},
+    },
+    "성직자": {
+        "heal": {"name":"💚 힐","mp":15,"heal":100,"desc":"HP 회복"},
+        "holy_light": {"name":"✨ 성광","mp":20,"mult":2.0,"desc":"언데드 특효"},
+        "resurrection": {"name":"🌟 부활","mp":50,"revive":True,"desc":"전투 중 부활"},
+        "blessing": {"name":"🙏 축복","mp":30,"team_def":1.3,"desc":"파티 방어력 30% 증가"},
+    },
+    "도적": {
+        "backstab": {"name":"🗡️ 백스탭","mp":10,"mult":3.5,"desc":"뒤에서 치명타"},
+        "smoke_bomb": {"name":"💨 연막탄","mp":15,"evade":True,"desc":"1턴 회피"},
+        "steal": {"name":"💰 도둑질","mp":12,"steal":True,"desc":"적 코인 탈취"},
+        "shadow_step": {"name":"👣 그림자 발걸음","mp":20,"mult":2.0,"first":True,"desc":"선제 공격"},
+    },
+    "기사": {
+        "holy_slash": {"name":"⚔️ 홀리 슬래시","mp":18,"mult":2.8,"desc":"성스러운 일격"},
+        "fortress": {"name":"🏰 철벽","mp":20,"def_boost":70,"desc":"압도적 방어"},
+    },
+    "암흑기사": {
+        "dark_crush": {"name":"🌑 다크 크러시","mp":24,"mult":3.5,"desc":"어둠의 강타"},
+        "blood_armor": {"name":"🩸 피의 갑주","mp":20,"heal":60,"desc":"흡혈 방어"},
+    },
+    "성궁수": {
+        "sun_burst": {"name":"☀️ 태양 연사","mp":22,"mult":3.0,"desc":"빛의 연사"},
+    },
+    "정령술사": {
+        "spirit_call": {"name":"🧚 정령 소환","mp":26,"mult":3.2,"desc":"정령의 일격"},
+    },
+    "대사제": {
+        "sacred_prayer": {"name":"⛪ 성역 기도","mp":32,"heal":220,"desc":"강력한 치유"},
+    },
+    "그림자군주": {
+        "night_reap": {"name":"🌘 나이트 리프","mp":28,"mult":4.0,"desc":"그림자 수확"},
+    },
+    "용기사": {
+        "dragon_drive": {"name":"🐉 드래곤 드라이브","mp":35,"mult":4.5,"desc":"용의 돌진"},
+    },
+    "시공마도사": {
+        "time_break": {"name":"🕰️ 타임 브레이크","mp":40,"mult":4.8,"desc":"시공 붕괴"},
+    },
+    "심판자": {
+        "judgement": {"name":"⚖️ 저지먼트","mp":38,"mult":4.6,"desc":"심판의 빛"},
+    },
+    "재앙의 그림자": {
+        "catastrophe": {"name":"☠️ 카타스트로피","mp":42,"mult":5.2,"desc":"재앙의 일격"},
+    },
+}
+
+MONSTERS = [
+    {"name":"🐺 늑대","hp":80,"atk":12,"def":3,"exp":20,"coins":15,"drop_rate":0.3},
+    {"name":"🐗 멧돼지","hp":120,"atk":18,"def":5,"exp":35,"coins":25,"drop_rate":0.35},
+    {"name":"💀 해골병사","hp":100,"atk":22,"def":8,"exp":45,"coins":30,"drop_rate":0.4},
+    {"name":"🧟 좀비","hp":150,"atk":15,"def":10,"exp":50,"coins":35,"drop_rate":0.4},
+    {"name":"🧙 다크 마법사","hp":90,"atk":35,"def":5,"exp":70,"coins":50,"drop_rate":0.45},
+    {"name":"🐉 드래곤 새끼","hp":300,"atk":40,"def":20,"exp":150,"coins":100,"drop_rate":0.6},
+    {"name":"👹 오크 전사","hp":200,"atk":30,"def":15,"exp":80,"coins":60,"drop_rate":0.5},
+    {"name":"🦇 흡혈귀","hp":180,"atk":28,"def":12,"exp":90,"coins":70,"drop_rate":0.5},
+    {"name":"🕷️ 거대 거미","hp":160,"atk":25,"def":8,"exp":75,"coins":55,"drop_rate":0.45},
+    {"name":"🌊 워터 엘리멘탈","hp":220,"atk":32,"def":18,"exp":110,"coins":80,"drop_rate":0.55},
+]
+
+BOSSES = [
+    {"name":"🐲 고룡 발로스","hp":5000,"atk":120,"def":60,"exp":2000,"coins":5000},
+    {"name":"💀 리치 왕","hp":8000,"atk":150,"def":40,"exp":3000,"coins":8000},
+    {"name":"👿 마왕 제라스","hp":15000,"atk":200,"def":80,"exp":5000,"coins":15000},
+    {"name":"🌑 어둠의 신","hp":30000,"atk":300,"def":120,"exp":10000,"coins":30000},
+]
+
+# 월드보스: 서버 전체 채널에 등장을 알리고, 여러 명이 함께 공격해 잡는 초대형 몬스터
+WORLD_BOSSES = [
+    {"name":"🌋 대재앙 이프리트","hp":100000,"atk":500,"def":150,"exp":20000,"coins":50000},
+    {"name":"🐋 심연의 리바이어던","hp":150000,"atk":600,"def":200,"exp":30000,"coins":80000},
+    {"name":"⚡ 뇌신 라이오넬","hp":200000,"atk":700,"def":250,"exp":40000,"coins":120000},
+]
+
+NPCS = {
+    "quest_npc_1": {"name":"📜 퀘스트 마스터 에리온","x":100,"y":98,"dialogue":"용사여, 마을을 위협하는 몬스터들을 처치해주시오!","quests":["kill_wolf_10","kill_boss_1","collect_mat_5","fish_10","explore_50"]},
+    "shop_npc_1": {"name":"🏪 상인 마르코","x":102,"y":100,"dialogue":"어서오세요! 좋은 물건 많습니다.","shop_items":["potion_hp_s","potion_hp_m","potion_mp_s","scroll_teleport","fishing_rod"]},
+    "blacksmith_npc": {"name":"⚒️ 대장장이 볼드","x":98,"y":100,"dialogue":"강화와 제작은 저에게 맡기세요!","services":["enchant","craft"]},
+    "guild_npc": {"name":"🏰 길드 관리인 세라","x":100,"y":102,"dialogue":"길드를 창설하거나 가입하시겠습니까?","services":["guild"]},
+    "pvp_npc": {"name":"⚔️ 콜로세움 관리인 마르스","x":150,"y":150,"dialogue":"실력을 증명해보세요. PVP와 전직의 전설이 여기서 시작됩니다.","services":["pvp"]},
+}
+
+QUEST_DATA = {
+    "kill_wolf_10": {"name":"늑대 사냥","desc":"늑대 10마리 처치","target":10,"type":"kill","reward_coins":500,"reward_exp":200,"reward_item":"potion_hp_m"},
+    "kill_boss_1": {"name":"보스 토벌","desc":"던전 보스 1마리 처치","target":1,"type":"kill_boss","reward_coins":2000,"reward_exp":1000,"reward_item":"w_0_10_2"},
+    "collect_mat_5": {"name":"재료 수집","desc":"철 재료 5개 수집","target":5,"type":"collect","item":"mat_철","reward_coins":300,"reward_exp":150,"reward_item":"potion_mp_m"},
+    "fish_10": {"name":"낚시왕","desc":"물고기 10마리 잡기","target":10,"type":"fish","reward_coins":400,"reward_exp":180,"reward_item":"fishing_rod_gold"},
+    "explore_50": {"name":"탐험가","desc":"50칸 이동","target":50,"type":"move","reward_coins":200,"reward_exp":100,"reward_item":"scroll_teleport"},
+}
+
+LANDMARKS = {
+    (100,100): {"type":"town","name":"🏘️ 시작 마을","desc":"안전 지역. 회복 가능."},
+    (50,50): {"type":"dungeon","name":"🏰 고대 던전","desc":"위험! 강한 몬스터 출현."},
+    (150,150): {"type":"colosseum","name":"⚔️ 콜로세움","desc":"PVP와 전직 도전자의 성지."},
+    (30,170): {"type":"shop","name":"🏪 대상인 거리","desc":"희귀 아이템 거래 가능."},
+    (170,30): {"type":"fishing","name":"🎣 낚시터","desc":"다양한 물고기 서식."},
+    (100,50): {"type":"halloween","name":"🎃 할로윈 존","desc":"한정 이벤트 지역."},
+    (100,150): {"type":"christmas","name":"🎄 크리스마스 존","desc":"한정 이벤트 지역."},
+}
+
+FISH_TABLE = [("🐟 잡어",5,10),("🐠 열대어",15,30),("🦈 상어",50,100),("🐙 문어",80,150),("🐋 고래",200,500),("✨ 전설의 물고기",1000,3000)]
+SHOP_ITEMS = {
+    "potion_hp_s": {"price":100}, "potion_hp_m": {"price":300}, "potion_hp_l": {"price":800},
+    "potion_mp_s": {"price":80}, "potion_mp_m": {"price":250}, "scroll_teleport": {"price":200},
+    "scroll_dungeon": {"price":500}, "fishing_rod": {"price":150},
+}
+BP_REWARDS = {
+    1: {"free":"potion_hp_s","premium":"potion_hp_m"},
+    5: {"free":"potion_mp_s","premium":"w_0_5_2"},
+    10: {"free":"scroll_teleport","premium":"w_0_10_3"},
+    20: {"free":"mat_미스릴","premium":"a_0_15_3"},
+    30: {"free":"fishing_rod","premium":"craft_fire_sword"},
+    50: {"free":"w_0_20_2","premium":"craft_dragon_armor"},
+}
+
+JOB_DATA = {
+    "초보자": {"tier":"기본","parent":None,"bonus":{},"desc":"모든 전직의 시작."},
+    "전사": {"tier":"일반","parent":"초보자","bonus":{"attack":12,"defense":8,"max_hp":40},"requirements":{"level":10},"desc":"안정적인 근접 전투 전문가."},
+    "궁수": {"tier":"일반","parent":"초보자","bonus":{"attack":14,"crit":6,"max_mp":10},"requirements":{"level":10},"desc":"치명타와 원거리 공격에 특화."},
+    "마법사": {"tier":"일반","parent":"초보자","bonus":{"attack":16,"max_mp":40},"requirements":{"level":10},"desc":"강력한 마법 화력 보유."},
+    "성직자": {"tier":"일반","parent":"초보자","bonus":{"defense":5,"max_hp":20,"max_mp":30},"requirements":{"level":10},"desc":"회복과 축복의 전문가."},
+    "도적": {"tier":"일반","parent":"초보자","bonus":{"attack":10,"crit":10},"requirements":{"level":10},"desc":"빠른 일격과 높은 치명타."},
+    "기사": {"tier":"히든","parent":"전사","bonus":{"attack":10,"defense":15,"max_hp":60},"requirements":{"level":20,"defense":35},"desc":"방패와 명예를 중시하는 수호자."},
+    "암흑기사": {"tier":"시크릿","parent":"기사","bonus":{"attack":20,"defense":10,"max_hp":80},"requirements":{"level":35,"kill_count":180},"desc":"어둠의 힘을 받아들인 기사."},
+    "성궁수": {"tier":"히든","parent":"궁수","bonus":{"attack":18,"crit":12},"requirements":{"level":22,"pvp_kill":3},"desc":"신성한 화살을 다루는 궁수."},
+    "정령술사": {"tier":"히든","parent":"마법사","bonus":{"attack":22,"max_mp":70},"requirements":{"level":22,"fish_count":20},"desc":"정령과 교감하는 마도사."},
+    "대사제": {"tier":"히든","parent":"성직자","bonus":{"defense":12,"max_hp":50,"max_mp":60},"requirements":{"level":22,"raid_count":2},"desc":"빛의 사제를 넘어선 존재."},
+    "그림자군주": {"tier":"히든","parent":"도적","bonus":{"attack":20,"crit":15},"requirements":{"level":22,"kill_count":120},"desc":"그림자 세계의 지배자."},
+    "용기사": {"tier":"시크릿","parent":"기사","bonus":{"attack":28,"defense":20,"max_hp":100},"requirements":{"level":40,"item":"craft_dragon_armor"},"desc":"용의 힘을 계승한 전설의 기사."},
+    "시공마도사": {"tier":"시크릿","parent":"정령술사","bonus":{"attack":30,"max_mp":120},"requirements":{"level":40,"item":"craft_thunder_staff"},"desc":"시공간을 비트는 초월 마도사."},
+    "심판자": {"tier":"시크릿","parent":"대사제","bonus":{"attack":24,"defense":18,"max_hp":90},"requirements":{"level":40,"pvp_kill":10},"desc":"빛의 심판을 내리는 사도."},
+    "재앙의 그림자": {"tier":"시크릿","parent":"그림자군주","bonus":{"attack":34,"crit":20},"requirements":{"level":42,"kill_count":300},"desc":"밤을 집어삼키는 암살 군주."},
+}
+
+TITLES = {
+    "몬스터 헌터": "몬스터 100마리 처치",
+    "대상인": "거래소 거래 50회",
+    "탐험가": "1000칸 이동",
+    "낚시왕": "물고기 100마리",
+    "레이드 영웅": "레이드 보스 10회 격파",
+    "PVP 챔피언": "PVP 50승",
+    "장인": "아이템 제작 20회",
+    "부자": "코인 100만 보유",
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# 플레이어 / 랭킹 / 전직 헬퍼
+# ═══════════════════════════════════════════════════════════════════════
+@dataclass(slots=True)
+class PlayerRecord:
+    user_id: int
+    username: str
+    guild_id: Optional[str] = None
+    job: str = "초보자"
+    title: str = ""
+    x: int = 100
+    y: int = 100
+    hp: int = 150
+    max_hp: int = 150
+    mp: int = 50
+    max_mp: int = 50
+    stamina: int = 100
+    max_stamina: int = 100
+    level: int = 1
+    exp: int = 0
+    coins: int = 1000
+    gems: int = 10
+    attack: int = 10
+    defense: int = 5
+    crit: int = 5
+    facing: str = "S"
+    biome: str = "평원"
+    equipment: dict = field(default_factory=dict)
+    state: dict = field(default_factory=dict)
+    appearance: dict = field(default_factory=dict)
+    achievements: list = field(default_factory=list)
+    tutorial_step: int = 0
+    season_bp_level: int = 0
+    season_bp_exp: int = 0
+    partner_id: int = 0
+    brother_id: int = 0
+    invite_code: str = ""
+    invited_by: int = 0
+    voice_bonus_until: str = ""
+    skill_points: int = 0
+    traits: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, r):
+        d = dict(r) if not isinstance(r, dict) else r
+        return cls(
+            user_id=d["user_id"], username=d["username"], guild_id=d.get("guild_id"),
+            job=d["job"], title=d["title"] or "", x=d["x"], y=d["y"],
+            hp=d["hp"], max_hp=d["max_hp"], mp=d["mp"], max_mp=d["max_mp"],
+            stamina=d["stamina"], max_stamina=d["max_stamina"], level=d["level"], exp=d["exp"],
+            coins=d["coins"], gems=d["gems"], attack=d["attack"], defense=d["defense"], crit=d["crit"],
+            facing=d["facing"], biome=d["biome"], equipment=uj(d.get("equipment_json", "{}")),
+            state=uj(d.get("state_json", "{}")), appearance=uj(d.get("appearance_json", "{}")),
+            achievements=uj(d.get("achievements_json", "[]")) if d.get("achievements_json") else [],
+            tutorial_step=d.get("tutorial_step") or 0, season_bp_level=d.get("season_bp_level") or 0,
+            season_bp_exp=d.get("season_bp_exp") or 0, partner_id=d.get("partner_id") or 0,
+            brother_id=d.get("brother_id") or 0, invite_code=d.get("invite_code") or "",
+            invited_by=d.get("invited_by") or 0, voice_bonus_until=d.get("voice_bonus_until") or "",
+            skill_points=d.get("skill_points") or 0, traits=uj(d.get("traits_json", "{}")),
+        )
+
+
+def ensure_state_defaults(p: PlayerRecord):
+    if not isinstance(p.state, dict):
+        p.state = {}
+    p.state.setdefault("kill_count", 0)
+    p.state.setdefault("move_count", 0)
+    p.state.setdefault("fish_count", 0)
+    p.state.setdefault("raid_count", 0)
+    p.state.setdefault("pvp_win", 0)
+    p.state.setdefault("pvp_loss", 0)
+    p.state.setdefault("pvp_kill", 0)
+    p.state.setdefault("craft_count", 0)
+    p.state.setdefault("trade_count", 0)
+    p.state.setdefault("job_history", [p.job] if p.job else ["초보자"])
+    p.state.setdefault("job_bonus", {})
+    p.state.setdefault("slots_today", {})
+    p.state.setdefault("set_bonus", {})
+    if not isinstance(p.traits, dict):
+        p.traits = {}
+    if not isinstance(p.equipment, dict):
+        p.equipment = {}
+    if "armor" in p.equipment and "body" not in p.equipment:
+        p.equipment["body"] = p.equipment.pop("armor")
+
+
+async def save_player(p: PlayerRecord):
+    ensure_state_defaults(p)
+    await execute(
+        """
+        UPDATE players SET username=?,guild_id=?,job=?,title=?,x=?,y=?,hp=?,max_hp=?,mp=?,max_mp=?,
+        stamina=?,max_stamina=?,level=?,exp=?,coins=?,gems=?,attack=?,defense=?,crit=?,
+        facing=?,biome=?,equipment_json=?,state_json=?,appearance_json=?,achievements_json=?,
+        tutorial_step=?,season_bp_level=?,season_bp_exp=?,partner_id=?,brother_id=?,
+        invite_code=?,invited_by=?,voice_bonus_until=?,skill_points=?,traits_json=? WHERE user_id=?
+        """,
+        (
+            p.username,p.guild_id,p.job,p.title,p.x,p.y,p.hp,p.max_hp,p.mp,p.max_mp,
+            p.stamina,p.max_stamina,p.level,p.exp,p.coins,p.gems,p.attack,p.defense,p.crit,
+            p.facing,p.biome,j(p.equipment),j(p.state),j(p.appearance),j(p.achievements),
+            p.tutorial_step,p.season_bp_level,p.season_bp_exp,p.partner_id,p.brother_id,
+            p.invite_code,p.invited_by,p.voice_bonus_until,p.skill_points,j(p.traits),p.user_id,
+        ),
+    )
+
+
+async def ensure_player(uid: int, name: str, gid=None) -> PlayerRecord:
+    row = await fetch_one("SELECT * FROM players WHERE user_id=?", (uid,))
+    if row:
+        p = PlayerRecord.from_row(row)
+        ensure_state_defaults(p)
+        return p
+    code = uuid.uuid4().hex[:8].upper()
+    await execute("INSERT INTO players (user_id,username,guild_id,invite_code) VALUES (?,?,?,?)", (uid, name, gid, code))
+    p = await ensure_player(uid, name, gid)
+    await save_player(p)
+    return p
+
+
+async def add_exp(p: PlayerRecord, exp: int):
+    p.exp += exp
+    need = p.level * 100
+    leveled = False
+    while p.exp >= need:
+        p.exp -= need
+        p.level += 1
+        p.max_hp += 20
+        p.hp = p.max_hp
+        p.max_mp += 10
+        p.mp = p.max_mp
+        p.attack += 3
+        p.defense += 2
+        p.crit += 1
+        p.skill_points += 1
+        need = p.level * 100
+        leveled = True
+    await save_player(p)
+    return leveled
+
+
+async def add_item(uid: int, item_code: str, qty: int = 1):
+    item = ITEM_CATALOG.get(item_code)
+    if not item:
+        return False
+    row = await fetch_one("SELECT id,qty FROM inventory_items WHERE user_id=? AND item_code=?", (uid, item_code))
+    if row:
+        await execute("UPDATE inventory_items SET qty=qty+? WHERE id=?", (qty, row["id"]))
+    else:
+        await execute(
+            "INSERT INTO inventory_items (user_id,item_code,item_name,item_type,rarity,qty,power,defense,meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            (uid, item_code, item.name, item.item_type, item.rarity, qty, item.power, item.defense, j(item.meta)),
+        )
+    return True
+
+
+async def has_item(uid: int, item_code: str) -> bool:
+    row = await fetch_one("SELECT qty FROM inventory_items WHERE user_id=? AND item_code=?", (uid, item_code))
+    return bool(row and row["qty"] > 0)
+
+
+async def add_rank_score(uid: int, category: str, delta: int, season: str = "global"):
+    await execute(
+        """
+        INSERT INTO rankings (user_id,category,score,season) VALUES (?,?,?,?)
+        ON CONFLICT(user_id,category,season) DO UPDATE SET score=score+excluded.score
+        """,
+        (uid, category, delta, season),
+    )
+
+
+async def set_rank_score(uid: int, category: str, score: int, season: str = "global"):
+    await execute(
+        """
+        INSERT INTO rankings (user_id,category,score,season) VALUES (?,?,?,?)
+        ON CONFLICT(user_id,category,season) DO UPDATE SET score=excluded.score
+        """,
+        (uid, category, score, season),
+    )
+
+
+async def get_leaderboard(category: str, limit: int = 10) -> List[aiosqlite.Row]:
+    return await fetch_all(
+        """
+        SELECT p.username, p.level, r.score
+        FROM rankings r
+        JOIN players p ON p.user_id = r.user_id
+        WHERE r.category=? AND r.season='global'
+        ORDER BY r.score DESC, p.level DESC, p.username ASC
+        LIMIT ?
+        """,
+        (category, limit),
+    )
+
+
+def get_job_bonus(job_name: str) -> dict:
+    return JOB_DATA.get(job_name, {}).get("bonus", {})
+
+
+def job_skill_key(job_name: str) -> str:
+    if job_name in SKILL_TREE:
+        return job_name
+    parent = JOB_DATA.get(job_name, {}).get("parent")
+    while parent:
+        if parent in SKILL_TREE:
+            return parent
+        parent = JOB_DATA.get(parent, {}).get("parent")
+    return job_name
+
+
+def check_job_requirements(p: PlayerRecord, job_name: str) -> Tuple[bool, str]:
+    info = JOB_DATA.get(job_name)
+    if not info:
+        return False, "존재하지 않는 전직입니다."
+    req = info.get("requirements", {})
+    if p.level < req.get("level", 0):
+        return False, f"레벨 {req['level']} 이상 필요"
+    if req.get("defense") and p.defense < req["defense"]:
+        return False, f"방어력 {req['defense']} 이상 필요"
+    if req.get("kill_count") and p.state.get("kill_count", 0) < req["kill_count"]:
+        return False, f"몬스터 처치 {req['kill_count']}회 필요"
+    if req.get("pvp_kill") and p.state.get("pvp_kill", 0) < req["pvp_kill"]:
+        return False, f"PVP 킬 {req['pvp_kill']}회 필요"
+    if req.get("fish_count") and p.state.get("fish_count", 0) < req["fish_count"]:
+        return False, f"낚시 {req['fish_count']}회 필요"
+    if req.get("raid_count") and p.state.get("raid_count", 0) < req["raid_count"]:
+        return False, f"레이드 {req['raid_count']}회 필요"
+    if req.get("item"):
+        equipped = bool(p.equipment and req["item"] in p.equipment.values())
+        if not equipped:
+            return False, f"장비/소지 조건 필요: {ITEM_CATALOG.get(req['item'], Item(req['item'], req['item'], '', '')).name}"
+    parent = info.get("parent")
+    if parent and parent != "초보자" and p.job != parent:
+        return False, f"{parent} 계열에서만 전직 가능"
+    return True, "가능"
+
+
+async def apply_job_change(p: PlayerRecord, new_job: str, learned_from: int = 0) -> Tuple[bool, str]:
+    if new_job == p.job:
+        return False, "이미 해당 직업입니다."
+    ensure_state_defaults(p)
+    old_bonus = p.state.get("job_bonus", {})
+    p.attack -= old_bonus.get("attack", 0)
+    p.defense -= old_bonus.get("defense", 0)
+    p.crit -= old_bonus.get("crit", 0)
+    p.max_hp -= old_bonus.get("max_hp", 0)
+    p.max_mp -= old_bonus.get("max_mp", 0)
+    p.max_hp = max(50, p.max_hp)
+    p.max_mp = max(10, p.max_mp)
+    p.hp = min(p.hp, p.max_hp)
+    p.mp = min(p.mp, p.max_mp)
+
+    new_bonus = get_job_bonus(new_job)
+    p.attack += new_bonus.get("attack", 0)
+    p.defense += new_bonus.get("defense", 0)
+    p.crit += new_bonus.get("crit", 0)
+    p.max_hp += new_bonus.get("max_hp", 0)
+    p.max_mp += new_bonus.get("max_mp", 0)
+    p.hp = p.max_hp
+    p.mp = p.max_mp
+    p.job = new_job
+    p.state["job_bonus"] = new_bonus
+    if new_job not in p.state["job_history"]:
+        p.state["job_history"].append(new_job)
+    if learned_from:
+        p.state["last_teacher_id"] = learned_from
+    await save_player(p)
+    return True, f"🎓 **{new_job}** 전직 완료!"
+
+
+async def get_available_jobs(p: PlayerRecord) -> Dict[str, List[Tuple[str, str, bool]]]:
+    ensure_state_defaults(p)
+    result = {"일반": [], "히든": [], "시크릿": []}
+    for job_name, info in JOB_DATA.items():
+        tier = info.get("tier")
+        if tier not in result:
+            continue
+        ok, reason = check_job_requirements(p, job_name)
+        result[tier].append((job_name, reason, ok))
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════
+# 월드 / 전투 / 시스템 함수
+# ═══════════════════════════════════════════════════════════════════════
+BIOME_TILES = {"평원":"🟫","숲":"🌲","사막":"🏜️","설원":"❄️","화산":"🌋","바다":"🌊","동굴":"🕳️"}
+
+
+def _get_biome(x: int, y: int) -> str:
+    v = (x * 3 + y * 7) % 100
+    if v < 40: return "평원"
+    if v < 60: return "숲"
+    if v < 70: return "사막"
+    if v < 78: return "설원"
+    if v < 84: return "화산"
+    if v < 90: return "바다"
+    return "동굴"
+
+
+def _get_tile(x: int, y: int, px: int, py: int) -> str:
+    if x == px and y == py:
+        return "😺"
+    if (x, y) in LANDMARKS:
+        return {"town":"🏘️","dungeon":"🏰","colosseum":"⚔️","shop":"🏪","fishing":"🎣","halloween":"🎃","christmas":"🎄"}.get(LANDMARKS[(x, y)]["type"], "❓")
+    for npc in NPCS.values():
+        if x == npc["x"] and y == npc["y"]:
+            return "💬"
+    if (x + y) % 23 == 0:
+        return "🏠"
+    return BIOME_TILES.get(_get_biome(x, y), "🟫")
+
+
+def render_raid_screen(p: PlayerRecord) -> str:
+    return "\n".join([
+        "```",
+        "╔════════════ 🐲 레이드 ════════════╗",
+        "║      🔥 전장의 한복판! 🔥          ║",
+        "║                                      ║",
+        "║          🐲 거대 보스 🐲            ║",
+        "║          ⚔️⚔️⚔️⚔️⚔️⚔️⚔️⚔️            ║",
+        "║                                      ║",
+        f"╠══ ❤️{p.hp}/{p.max_hp} 💙{p.mp}/{p.max_mp} ⚡{p.stamina}/{p.max_stamina} ══╣",
+        "╚══════════════════════════════════════╝",
+        "```",
+    ])
+
+
+def render_house_screen(p: PlayerRecord) -> str:
+    return "\n".join([
+        "```",
+        "╔════════════ 🏠 내 집 ════════════╗",
+        f"║ 플레이어: {p.username}의 아늑한 보금자리  ║",
+        "║                                      ║",
+        "║      🛏️        📺        🪑      ║",
+        "║     침대      TV      의자      ║",
+        "║                                      ║",
+        f"╠══ ❤️{p.hp}/{p.max_hp} 💙{p.mp}/{p.max_mp} ⚡{p.stamina}/{p.max_stamina} ══╣",
+        "╚══════════════════════════════════════╝",
+        "```",
+    ])
+
+
+def render_map(p: PlayerRecord, view_dist: int = 4, extra_status: str = "") -> str:
+    """맵 본문(아스키 아트)만 반환합니다. 좌표/상태 텍스트는 build_rpg_embed()에서
+    임베드 필드/푸터로 따로 표시되어 메시지 본문 공간을 차지하지 않습니다."""
+    ensure_state_defaults(p)
+    if p.state.get("in_raid"):
+        return render_raid_screen(p)
+    if p.state.get("in_house"):
+        return render_house_screen(p)
+    title_str = f"[{p.title}] " if p.title else ""
+    lines = ["```", f"╔══ {title_str}{p.username} | Lv.{p.level} {p.job} ══╗"]
+    for row_y in range(p.y - view_dist, p.y + view_dist + 1):
+        row = "║ "
+        for col_x in range(p.x - view_dist, p.x + view_dist + 1):
+            if 0 <= col_x < WORLD_W and 0 <= row_y < WORLD_H:
+                row += _get_tile(col_x, row_y, p.x, p.y)
+            else:
+                row += "🌌"
+        lines.append(row + " ║")
+    lines.append(f"╠══ ❤️{p.hp}/{p.max_hp} 💙{p.mp}/{p.max_mp} ⚡{p.stamina}/{p.max_stamina} ══╣")
+    lines.append(f"║ 💰{p.coins:,}  💎{p.gems}  ⚔️{p.attack}  🛡️{p.defense}  🎯{p.crit}% ║")
+    lines.append("╚══════════════════════════════════════╝")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def build_rpg_embed(p: PlayerRecord, extra_status: str = "") -> discord.Embed:
+    """RPG 맵 UI를 임베드로 표시합니다."""
+    ensure_state_defaults(p)
+    title_str = f"[{p.title}] " if p.title else ""
+    embed = discord.Embed(
+        title=f"🎮 {title_str}{p.username} | Lv.{p.level} {p.job}",
+        description=render_map(p),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="⚡ 자원", value=f"❤️{p.hp}/{p.max_hp} 💙{p.mp}/{p.max_mp} ⚡{p.stamina}/{p.max_stamina}", inline=False)
+    status_text = (extra_status or p.state.get("ui_status") or "").strip()
+    if status_text:
+        safe_status = status_text.replace("```", "'''")
+        if len(safe_status) > 1024:
+            safe_status = safe_status[:1021] + "..."
+        embed.add_field(name="📌 상태", value=safe_status, inline=False)
+    embed.set_footer(text="이 창은 본인만 볼 수 있습니다.")
+    return embed
+
+
+def render_minimap(p: PlayerRecord) -> str:
+    mini = 20
+    step_x = WORLD_W // mini
+    step_y = WORLD_H // mini
+    lines = ["```", "╔══════ 🗺️ 월드 미니맵 ══════╗"]
+    for my in range(mini):
+        row = "║"
+        for mx in range(mini):
+            wx = mx * step_x + step_x // 2
+            wy = my * step_y + step_y // 2
+            if abs(wx - p.x) <= step_x // 2 and abs(wy - p.y) <= step_y // 2:
+                row += "😺"
+                continue
+            found = False
+            for (lx, ly), lm in LANDMARKS.items():
+                if abs(wx - lx) <= step_x and abs(wy - ly) <= step_y:
+                    row += {"town":"🏘","dungeon":"🏰","colosseum":"⚔","shop":"🏪","fishing":"🎣","halloween":"🎃","christmas":"🎄"}.get(lm["type"], "❓")
+                    found = True
+                    break
+            if not found:
+                row += {"평원":"🟩","숲":"🌲","사막":"🟨","설원":"⬜","화산":"🟥","바다":"🟦","동굴":"⬛"}.get(_get_biome(wx, wy), "🟩")
+        lines.append(row + "║")
+    lines.extend(["╚══════════════════════════════╝", "  😺=나  🏘=마을  🏰=던전  ⚔=콜로세움", "```"])
+    return "\n".join(lines)
+
+
+async def try_move(p: PlayerRecord, d: str) -> Tuple[bool, str]:
+    dx, dy = {"W":(0,-1),"A":(-1,0),"S":(0,1),"D":(1,0)}.get(d, (0,0))
+    nx, ny = max(0, min(WORLD_W-1, p.x + dx)), max(0, min(WORLD_H-1, p.y + dy))
+    row = await fetch_one("SELECT tile_type FROM world_tiles WHERE x=? AND y=?", (nx, ny))
+    if row and row["tile_type"] in ["wall", "water"]:
+        return False, f"🚫 이동 불가 ({row['tile_type']})"
+    p.x, p.y, p.facing = nx, ny, d
+    p.stamina = max(0, p.stamina - 1)
+    p.biome = _get_biome(nx, ny)
+    p.state["move_count"] = p.state.get("move_count", 0) + 1
+    q_msg = await check_quest_progress(p.user_id, "move") or ""
+    lm = LANDMARKS.get((nx, ny))
+    if lm:
+        status_msg = f"📍 {lm['name']} 도착!\n{lm['desc']}\n{q_msg}".strip()
+    else:
+        status_msg = f"📍 ({nx},{ny}) {p.biome}\n{q_msg}".strip()
+    p.state["ui_status"] = status_msg
+    await save_player(p)
+    return True, status_msg
+
+
+def calc_damage(atk: int, def_: int, crit: int) -> Tuple[int, bool]:
+    is_crit = random.randint(1, 100) <= crit
+    dmg = max(1, atk - def_ + random.randint(-3, 3))
+    if is_crit:
+        dmg = int(dmg * 1.8)
+    return dmg, is_crit
+
+
+async def fight_monster(p: PlayerRecord, monster: dict) -> dict:
+    mob = dict(monster)
+    mob_hp = mob["hp"]
+    lines = [f"⚔️ **{mob['name']}** 와(과) 전투 시작!"]
+    rounds = 0
+    while p.hp > 0 and mob_hp > 0 and rounds < 20:
+        dmg, crit = calc_damage(p.attack, mob["def"], p.crit)
+        mob_hp -= dmg
+        lines.append(f"{'💥 치명타! ' if crit else ''}내 공격: **{dmg}** → 몬스터 HP: {max(0,mob_hp)}")
+        if mob_hp <= 0:
+            break
+        m_dmg, _ = calc_damage(mob["atk"], p.defense, 5)
+        p.hp = max(0, p.hp - m_dmg)
+        lines.append(f"몬스터 공격: **{m_dmg}** → 내 HP: {p.hp}")
+        rounds += 1
+    if mob_hp <= 0:
+        exp_gain = mob["exp"]
+        coin_gain = mob["coins"] + random.randint(0, max(1, mob["coins"] // 2))
+        leveled = await add_exp(p, exp_gain)
+        p.coins += coin_gain
+        p.state["kill_count"] = p.state.get("kill_count", 0) + 1
+        await set_rank_score(p.user_id, "level", p.level)
+        await save_player(p)
+        q_msg = await check_quest_progress(p.user_id, "kill") or ""
+        drop_item = None
+        if random.random() < mob.get("drop_rate", 0.3):
+            drop_code = random.choice(list(ITEM_CATALOG.keys()))
+            await add_item(p.user_id, drop_code)
+            drop_item = ITEM_CATALOG[drop_code].name
+        lines.append(f"\n🏆 **승리!** EXP +{exp_gain} | 💰 +{coin_gain}")
+        if leveled:
+            lines.append(f"🎉 **레벨 업! Lv.{p.level}**")
+        if drop_item:
+            lines.append(f"📦 드롭: {drop_item}")
+        if q_msg:
+            lines.append(q_msg)
+        return {"win": True, "log": "\n".join(lines)}
+    p.hp = max(1, p.hp)
+    await save_player(p)
+    lines.append("\n💀 **패배!** HP가 1로 유지됩니다.")
+    return {"win": False, "log": "\n".join(lines)}
+
+
+async def fight_pvp(p1: PlayerRecord, p2: PlayerRecord) -> dict:
+    p1_hp, p2_hp = p1.hp, p2.hp
+    logs = [f"⚔️ **{p1.username}** vs **{p2.username}** PVP 시작!"]
+    for _ in range(30):
+        d1, c1 = calc_damage(p1.attack, p2.defense, p1.crit)
+        p2_hp -= d1
+        logs.append(f"{'💥 ' if c1 else ''}**{p1.username}** → {d1} 데미지")
+        if p2_hp <= 0:
+            break
+        d2, c2 = calc_damage(p2.attack, p1.defense, p2.crit)
+        p1_hp -= d2
+        logs.append(f"{'💥 ' if c2 else ''}**{p2.username}** → {d2} 데미지")
+        if p1_hp <= 0:
+            break
+    winner = p1 if p2_hp <= 0 else p2
+    loser = p2 if winner.user_id == p1.user_id else p1
+    prize = min(500, loser.coins // 10)
+    winner.coins += prize
+    loser.coins = max(0, loser.coins - prize)
+    winner.state["pvp_win"] = winner.state.get("pvp_win", 0) + 1
+    winner.state["pvp_kill"] = winner.state.get("pvp_kill", 0) + 1
+    loser.state["pvp_loss"] = loser.state.get("pvp_loss", 0) + 1
+    await add_rank_score(winner.user_id, "pvp_kill", 1)
+    await add_rank_score(winner.user_id, "pvp_win", 1)
+    await save_player(winner)
+    await save_player(loser)
+    logs.append(f"\n🏆 **{winner.username}** 승리! 💰 +{prize}")
+    return {"winner": winner.user_id, "log": "\n".join(logs)}
+
+
+async def dungeon_fight(p: PlayerRecord, floor: int) -> dict:
+    mob = MONSTERS[min(floor - 1, len(MONSTERS) - 1)]
+    scaled = dict(mob)
+    scaled["hp"] = mob["hp"] + floor * 30
+    scaled["atk"] = mob["atk"] + floor * 5
+    scaled["def"] = mob["def"] + floor * 2
+    scaled["exp"] = mob["exp"] + floor * 20
+    scaled["coins"] = mob["coins"] + floor * 15
+    return await fight_monster(p, scaled)
+
+
+async def dungeon_boss_fight(p: PlayerRecord) -> dict:
+    boss = random.choice(BOSSES)
+    result = await fight_monster(p, {**boss, "drop_rate": 0.9})
+    if result["win"]:
+        p.state["raid_count"] = p.state.get("raid_count", 0) + 1
+        await save_player(p)
+    return result
+
+
+async def create_raid(boss_idx: int = 0) -> Tuple[str, dict]:
+    boss = BOSSES[boss_idx % len(BOSSES)]
+    raid_id = uuid.uuid4().hex[:8]
+    await execute("INSERT INTO raid_sessions (raid_id,boss_name,boss_hp,boss_max_hp,participants_json) VALUES (?,?,?,?,?)", (raid_id, boss["name"], boss["hp"], boss["hp"], j({})))
+    return raid_id, boss
+
+
+async def join_raid(raid_id: str, p: PlayerRecord) -> Tuple[bool, str]:
+    row = await fetch_one("SELECT * FROM raid_sessions WHERE raid_id=? AND state='active'", (raid_id,))
+    if not row:
+        return False, "레이드를 찾을 수 없습니다."
+    participants = uj(row["participants_json"])
+    if str(p.user_id) in participants:
+        return False, "이미 참가 중입니다."
+    participants[str(p.user_id)] = {"name": p.username, "dmg": 0}
+    await execute("UPDATE raid_sessions SET participants_json=? WHERE raid_id=?", (j(participants), raid_id))
+    return True, f"✅ 레이드 참가! 보스: {row['boss_name']} | HP: {row['boss_hp']:,}"
+
+
+async def attack_raid(raid_id: str, p: PlayerRecord) -> Tuple[bool, str]:
+    row = await fetch_one("SELECT * FROM raid_sessions WHERE raid_id=? AND state='active'", (raid_id,))
+    if not row:
+        return False, "레이드가 종료되었습니다."
+    participants = uj(row["participants_json"])
+    if str(p.user_id) not in participants:
+        return False, "먼저 레이드에 참가하세요."
+    dmg, crit = calc_damage(p.attack * 2, 20, p.crit)
+    boss_hp = row["boss_hp"] - dmg
+    participants[str(p.user_id)]["dmg"] += dmg
+    msg = f"{'💥 치명타! ' if crit else ''}**{dmg}** 데미지! 보스 HP: {max(0, boss_hp):,}"
+    if boss_hp <= 0:
+        await execute("UPDATE raid_sessions SET state='clear',boss_hp=0,participants_json=? WHERE raid_id=?", (j(participants), raid_id))
+        boss_data = next((b for b in BOSSES if b["name"] == row["boss_name"]), BOSSES[0])
+        total_dmg = sum(v["dmg"] for v in participants.values())
+        rewards = []
+        for uid_str, data in participants.items():
+            uid = int(uid_str)
+            ratio = data["dmg"] / max(1, total_dmg)
+            coin_reward = int(boss_data["coins"] * ratio)
+            exp_reward = int(boss_data["exp"] * ratio)
+            prow = await fetch_one("SELECT * FROM players WHERE user_id=?", (uid,))
+            if prow:
+                pr = PlayerRecord.from_row(prow)
+                ensure_state_defaults(pr)
+                pr.coins += coin_reward
+                pr.state["raid_count"] = pr.state.get("raid_count", 0) + 1
+                await add_exp(pr, exp_reward)
+                await save_player(pr)
+                rewards.append(f"  {data['name']}: 💰+{coin_reward:,} EXP+{exp_reward}")
+        return True, msg + "\n🎉 **레이드 클리어!**\n" + "\n".join(rewards)
+    await execute("UPDATE raid_sessions SET boss_hp=?,participants_json=? WHERE raid_id=?", (boss_hp, j(participants), raid_id))
+    return True, msg
+
+
+async def enchant_item(uid: int, inv_id: int) -> Tuple[bool, str]:
+    row = await fetch_one("SELECT * FROM inventory_items WHERE id=? AND user_id=?", (inv_id, uid))
+    if not row:
+        return False, "아이템을 찾을 수 없습니다."
+    lv = row["enchant_level"]
+    if lv >= 15:
+        return False, "최대 강화 수치(+15)입니다."
+    cost = (lv + 1) * 200
+    prow = await fetch_one("SELECT * FROM players WHERE user_id=?", (uid,))
+    if not prow:
+        return False, "플레이어를 찾을 수 없습니다."
+    p = PlayerRecord.from_row(prow)
+    if p.coins < cost:
+        return False, f"코인 부족 (필요: {cost})"
+    p.coins -= cost
+    rate = max(10, 100 - lv * 7)
+    if random.randint(1, 100) <= rate:
+        await execute("UPDATE inventory_items SET enchant_level=?,power=power+15,defense=defense+8 WHERE id=?", (lv + 1, inv_id))
+        await save_player(p)
+        return True, f"✨ 강화 성공! (+{lv + 1}) 💰 -{cost}"
+    await save_player(p)
+    return False, f"❌ 강화 실패 (확률: {rate}%) 💰 -{cost}"
+
+
+async def craft_item(p: PlayerRecord, item_code: str) -> Tuple[bool, str]:
+    recipe = CRAFT_RECIPES.get(item_code)
+    if not recipe:
+        return False, "제작 레시피가 없습니다."
+    if p.coins < recipe["코인"]:
+        return False, f"코인 부족 (필요: {recipe['코인']:,})"
+    for mat_code, qty in recipe["재료"].items():
+        row = await fetch_one("SELECT qty FROM inventory_items WHERE user_id=? AND item_code=?", (p.user_id, mat_code))
+        if not row or row["qty"] < qty:
+            return False, f"재료 부족: {ITEM_CATALOG.get(mat_code, Item(mat_code, mat_code, '', '')).name} x{qty}"
+    for mat_code, qty in recipe["재료"].items():
+        await execute("UPDATE inventory_items SET qty=qty-? WHERE user_id=? AND item_code=?", (qty, p.user_id, mat_code))
+        await execute("DELETE FROM inventory_items WHERE user_id=? AND item_code=? AND qty<=0", (p.user_id, mat_code))
+    p.coins -= recipe["코인"]
+    p.state["craft_count"] = p.state.get("craft_count", 0) + 1
+    await save_player(p)
+    await add_item(p.user_id, item_code)
+    return True, f"⚒️ **{ITEM_CATALOG[item_code].name}** 제작 완료!"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 장비 슬롯 / 세트효과
+# ═══════════════════════════════════════════════════════════════════════
+def resolve_slot(item_type: str, item_code: str) -> str:
+    """인벤토리 아이템이 어느 장비 슬롯(weapon/head/body/gloves/boots)에 들어가는지 판별."""
+    if item_type == "무기":
+        return "weapon"
+    it = ITEM_CATALOG.get(item_code)
+    if it and it.meta.get("slot"):
+        return it.meta["slot"]
+    if item_code.startswith("a_"):
+        try:
+            t_idx = int(item_code.split("_")[1])
+            return ARMOR_SLOT_BY_INDEX.get(t_idx, "body")
+        except (ValueError, IndexError):
+            pass
+    return "body"
+
+
+def compute_set_bonus(equipment: dict) -> Dict[str, int]:
+    """현재 장착 중인 장비를 기준으로 세트효과 스탯 보너스를 계산 (세트별 최고 단계만 적용, 비누적)."""
+    counts: Dict[str, int] = defaultdict(int)
+    for code in equipment.values():
+        it = ITEM_CATALOG.get(code)
+        if it and it.meta.get("set"):
+            counts[it.meta["set"]] += 1
+    total: Dict[str, int] = defaultdict(int)
+    for set_code, cnt in counts.items():
+        conf = ITEM_SETS.get(set_code)
+        if not conf:
+            continue
+        best: Dict[str, int] = {}
+        for need in sorted(conf["bonus"].keys()):
+            if cnt >= need:
+                best = conf["bonus"][need]
+        for k, v in best.items():
+            if k != "desc":
+                total[k] += v
+    return dict(total)
+
+
+def _apply_stat_delta(p: PlayerRecord, delta: Dict[str, int], sign: int):
+    for stat, val in delta.items():
+        amount = val * sign
+        if stat == "max_hp":
+            p.max_hp = max(1, p.max_hp + amount)
+            p.hp = min(p.hp, p.max_hp)
+        elif stat == "max_mp":
+            p.max_mp = max(0, p.max_mp + amount)
+            p.mp = min(p.mp, p.max_mp)
+        elif stat in ("attack", "defense", "crit"):
+            setattr(p, stat, max(0, getattr(p, stat) + amount))
+
+
+async def equip_item(p: PlayerRecord, slot: str, item_row) -> str:
+    """지정 슬롯에 아이템을 장착하고, 세트효과를 포함한 전체 스탯을 재계산합니다."""
+    ensure_state_defaults(p)
+    old_set_bonus = compute_set_bonus(p.equipment)
+    old_code = p.equipment.get(slot)
+    if old_code:
+        old_item = ITEM_CATALOG.get(old_code)
+        if old_item:
+            p.attack = max(0, p.attack - old_item.power)
+            p.defense = max(0, p.defense - old_item.defense)
+    p.equipment[slot] = item_row["item_code"]
+    p.attack += item_row["power"]
+    p.defense += item_row["defense"]
+    new_set_bonus = compute_set_bonus(p.equipment)
+    _apply_stat_delta(p, old_set_bonus, -1)
+    _apply_stat_delta(p, new_set_bonus, 1)
+    p.state["set_bonus"] = new_set_bonus
+    await save_player(p)
+    msg = f"✅ **{item_row['item_name']}** 장착 완료!"
+    it = ITEM_CATALOG.get(item_row["item_code"])
+    if it and it.meta.get("set"):
+        set_conf = ITEM_SETS.get(it.meta["set"])
+        if set_conf and new_set_bonus:
+            msg += f"\n✨ {set_conf['name']} 효과 발동 중!"
+    return msg
+
+
+def get_equipped_summary(p: PlayerRecord) -> str:
+    slot_labels = {"weapon": "⚔️ 무기", "head": "🪖 투구", "body": "🥋 갑옷", "gloves": "🧤 장갑", "boots": "👢 신발"}
+    lines = []
+    for slot, label in slot_labels.items():
+        code = p.equipment.get(slot)
+        if code:
+            it = ITEM_CATALOG.get(code)
+            lines.append(f"{label}: {it.name if it else code}")
+        else:
+            lines.append(f"{label}: (없음)")
+    active_sets = []
+    counts: Dict[str, int] = defaultdict(int)
+    for code in p.equipment.values():
+        it = ITEM_CATALOG.get(code)
+        if it and it.meta.get("set"):
+            counts[it.meta["set"]] += 1
+    for set_code, cnt in counts.items():
+        conf = ITEM_SETS.get(set_code)
+        if conf and cnt >= 2:
+            active_sets.append(f"{conf['name']} ({cnt}/5)")
+    if active_sets:
+        lines.append("🌟 활성 세트: " + ", ".join(active_sets))
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 특성(패시브 스킬트리)
+# ═══════════════════════════════════════════════════════════════════════
+async def invest_trait(p: PlayerRecord, trait_code: str) -> Tuple[bool, str]:
+    trait = TRAITS.get(trait_code)
+    if not trait:
+        return False, "존재하지 않는 특성입니다."
+    if p.skill_points <= 0:
+        return False, "사용 가능한 특성 포인트가 없습니다. (레벨업 시 1포인트 획득)"
+    cur = p.traits.get(trait_code, 0)
+    if cur >= trait["max"]:
+        return False, f"{trait['name']}은(는) 이미 최대 단계입니다. (Lv.{trait['max']})"
+    p.traits[trait_code] = cur + 1
+    p.skill_points -= 1
+    _apply_stat_delta(p, {trait["stat"]: trait["per_point"]}, 1)
+    await save_player(p)
+    return True, f"✨ **{trait['name']}** Lv.{cur+1} 습득! ({trait['desc']})\n남은 포인트: {p.skill_points}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 길드 전쟁
+# ═══════════════════════════════════════════════════════════════════════
+async def declare_guild_war(guild_a: str, guild_b: str) -> Tuple[bool, str]:
+    if guild_a == guild_b:
+        return False, "같은 길드에는 선전포고할 수 없습니다."
+    a = await fetch_one("SELECT * FROM guilds WHERE guild_name=?", (guild_a,))
+    b = await fetch_one("SELECT * FROM guilds WHERE guild_name=?", (guild_b,))
+    if not a or not b:
+        return False, "길드를 찾을 수 없습니다."
+    existing = await fetch_one(
+        "SELECT * FROM guild_wars WHERE state='active' AND ((guild_a=? AND guild_b=?) OR (guild_a=? AND guild_b=?))",
+        (guild_a, guild_b, guild_b, guild_a),
+    )
+    if existing:
+        return False, "이미 진행 중인 전쟁입니다."
+    war_id = uuid.uuid4().hex[:8]
+    ends_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    await execute(
+        "INSERT INTO guild_wars (war_id,guild_a,guild_b,ends_at) VALUES (?,?,?,?)",
+        (war_id, guild_a, guild_b, ends_at),
+    )
+    return True, f"⚔️ **{guild_a}** 길드가 **{guild_b}** 길드에 전쟁을 선포했습니다! (24시간 진행, 기여 포인트가 높은 길드 승리)"
+
+
+async def get_active_war(guild_name: str):
+    return await fetch_one(
+        "SELECT * FROM guild_wars WHERE state='active' AND (guild_a=? OR guild_b=?)",
+        (guild_name, guild_name),
+    )
+
+
+async def contribute_war(p: PlayerRecord) -> Tuple[bool, str]:
+    if not p.guild_id:
+        return False, "길드에 가입되어 있지 않습니다."
+    war = await get_active_war(p.guild_id)
+    if not war:
+        return False, "진행 중인 길드 전쟁이 없습니다."
+    if p.stamina < 5:
+        return False, "스태미나가 부족합니다. (5 필요)"
+    now = datetime.now(timezone.utc)
+    ends = datetime.fromisoformat(war["ends_at"])
+    if now >= ends:
+        winner = war["guild_a"] if war["score_a"] >= war["score_b"] else war["guild_b"]
+        await execute("UPDATE guild_wars SET state='ended' WHERE war_id=?", (war["war_id"],))
+        await execute("UPDATE guilds SET treasury=treasury+50000, war_wins=war_wins+1 WHERE guild_name=?", (winner,))
+        return True, f"🏆 전쟁이 종료되었습니다! 승리 길드: **{winner}** (💰+50,000 금고 지급)"
+    p.stamina -= 5
+    dmg, crit = calc_damage(p.attack, 20, p.crit)
+    is_a = war["guild_a"] == p.guild_id
+    col = "score_a" if is_a else "score_b"
+    await execute(f"UPDATE guild_wars SET {col}={col}+? WHERE war_id=?", (dmg, war["war_id"]))
+    await save_player(p)
+    row = await fetch_one("SELECT * FROM guild_wars WHERE war_id=?", (war["war_id"],))
+    return True, (
+        f"{'💥 치명타! ' if crit else ''}⚔️ 전쟁 기여! **+{dmg}** 점수\n"
+        f"📊 {row['guild_a']} {row['score_a']:,} : {row['score_b']:,} {row['guild_b']}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 월드보스 (서버 전체 참여형)
+# ═══════════════════════════════════════════════════════════════════════
+async def create_world_boss() -> Tuple[str, dict]:
+    boss = random.choice(WORLD_BOSSES)
+    raid_id = uuid.uuid4().hex[:8]
+    await execute(
+        "INSERT INTO raid_sessions (raid_id,boss_name,boss_hp,boss_max_hp,participants_json,is_world) VALUES (?,?,?,?,?,1)",
+        (raid_id, boss["name"], boss["hp"], boss["hp"], j({})),
+    )
+    return raid_id, boss
+
+
+async def get_active_world_boss():
+    return await fetch_one("SELECT * FROM raid_sessions WHERE is_world=1 AND state='active' ORDER BY rowid DESC LIMIT 1")
+
+
+_fishing_sessions: Dict[int, dict] = {}
+
+async def start_fishing(uid: int) -> str:
+    delay = random.uniform(3, 8)
+    _fishing_sessions[uid] = {"fish_at": time.time() + delay}
+    return f"🎣 낚싯대를 드리웠습니다... {delay:.1f}초 후 버튼이 반짝입니다!"
+
+
+async def catch_fish(uid: int) -> Tuple[bool, str]:
+    session = _fishing_sessions.get(uid)
+    if not session:
+        return False, "낚시 중이 아닙니다."
+    now = time.time()
+    if now < session["fish_at"]:
+        return False, "⏳ 아직 입질이 없습니다!"
+    if now > session["fish_at"] + 3:
+        del _fishing_sessions[uid]
+        return False, "🐟 놓쳤습니다!"
+    del _fishing_sessions[uid]
+    fish = random.choices(FISH_TABLE, weights=[50,25,12,7,4,2])[0]
+    gain = random.randint(fish[1], fish[2])
+    row = await fetch_one("SELECT * FROM players WHERE user_id=?", (uid,))
+    if row:
+        p = PlayerRecord.from_row(row)
+        ensure_state_defaults(p)
+        p.coins += gain
+        p.state["fish_count"] = p.state.get("fish_count", 0) + 1
+        await save_player(p)
+        week = datetime.now(timezone.utc).strftime("%Y-W%U")
+        old = await fetch_one("SELECT id,score FROM fishing_contest WHERE user_id=? AND season_week=?", (uid, week))
+        if old:
+            await execute("UPDATE fishing_contest SET score=score+? WHERE id=?", (gain, old["id"]))
+        else:
+            await execute("INSERT INTO fishing_contest (user_id,score,season_week) VALUES (?,?,?)", (uid, gain, week))
+    q_msg = await check_quest_progress(uid, "fish") or ""
+    return True, f"🎣 **{fish[0]}** 낚음! 💰 +{gain}\n{q_msg}".strip()
+
+
+SLOT_SYMBOLS = ["🍒","🍋","🍊","🍇","⭐","💎","7️⃣"]
+SLOT_WEIGHTS = [30,25,20,15,6,3,1]
+
+async def play_slots(p: PlayerRecord, bet: int) -> Tuple[bool, str]:
+    cd = check_cooldown("slots", p.user_id, 30)
+    if cd:
+        return False, f"⏳ 슬롯머신 쿨다운: {cd:.0f}초"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = p.state.get("slots_today", {})
+    if daily.get("date") == today and daily.get("count", 0) >= 10:
+        return False, "오늘 슬롯머신 횟수(10회)를 모두 사용했습니다."
+    if p.coins < bet:
+        return False, "코인이 부족합니다."
+    p.coins -= bet
+    reels = random.choices(SLOT_SYMBOLS, weights=SLOT_WEIGHTS, k=3)
+    display = " | ".join(reels)
+    if reels[0] == reels[1] == reels[2]:
+        mult = {"7️⃣":50,"💎":20,"⭐":10,"🍇":5,"🍊":3,"🍋":2,"🍒":1.5}.get(reels[0], 2)
+        win = int(bet * mult)
+        p.coins += win
+        msg = f"🎰 {display}\n🎉 **잭팟!** 💰 +{win} (x{mult})"
+    elif reels[0] == reels[1] or reels[1] == reels[2]:
+        win = int(bet * 1.5)
+        p.coins += win
+        msg = f"🎰 {display}\n✨ 2개 일치! 💰 +{win}"
+    else:
+        msg = f"🎰 {display}\n😢 꽝! 💰 -{bet}"
+    p.state["slots_today"] = {"date": today, "count": 1 if daily.get('date') != today else daily.get('count', 0) + 1}
+    await save_player(p)
+    return True, msg
+
+
+async def play_dice(p: PlayerRecord, bet: int, guess: int) -> Tuple[bool, str]:
+    cd = check_cooldown("dice", p.user_id, 10)
+    if cd:
+        return False, f"⏳ 주사위 쿨다운: {cd:.0f}초"
+    if p.coins < bet:
+        return False, "코인이 부족합니다."
+    if guess < 1 or guess > 6:
+        return False, "1~6 사이 숫자를 선택하세요."
+    p.coins -= bet
+    result = random.randint(1, 6)
+    if result == guess:
+        win = bet * 5
+        p.coins += win
+        msg = f"🎲 결과: **{result}** | 예측: {guess} → 🎉 맞췄습니다! 💰 +{win}"
+    else:
+        msg = f"🎲 결과: **{result}** | 예측: {guess} → 😢 틀렸습니다. 💰 -{bet}"
+    await save_player(p)
+    return True, msg
+
+async def list_auction(seller_id: int, inv_id: int, min_bid: int) -> Tuple[bool, str]:
+    row = await fetch_one("SELECT * FROM inventory_items WHERE id=? AND user_id=?", (inv_id, seller_id))
+    if not row:
+        return False, "아이템을 찾을 수 없습니다."
+    end_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    await execute("INSERT INTO auction_house (seller_id,item_json,min_bid,current_bid,end_at) VALUES (?,?,?,?,?)", (seller_id, j(dict(row)), min_bid, min_bid, end_at))
+    await execute("DELETE FROM inventory_items WHERE id=?", (inv_id,))
+    return True, f"📦 **{row['item_name']}** 거래소 등록 완료! 시작가: {min_bid:,}코인"
+
+
+async def bid_auction(buyer: PlayerRecord, auction_id: int, bid: int) -> Tuple[bool, str]:
+    row = await fetch_one("SELECT * FROM auction_house WHERE id=?", (auction_id,))
+    if not row:
+        return False, "매물을 찾을 수 없습니다."
+    if datetime.fromisoformat(row["end_at"]) < datetime.now(timezone.utc):
+        return False, "경매가 종료되었습니다."
+    if bid <= row["current_bid"]:
+        return False, f"현재 최고가({row['current_bid']:,})보다 높아야 합니다."
+    if buyer.coins < bid:
+        return False, "코인이 부족합니다."
+    if row["highest_bidder"]:
+        await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (row["current_bid"], row["highest_bidder"]))
+    buyer.coins -= bid
+    buyer.state["trade_count"] = buyer.state.get("trade_count", 0) + 1
+    await save_player(buyer)
+    await execute("UPDATE auction_house SET current_bid=?,highest_bidder=? WHERE id=?", (bid, buyer.user_id, auction_id))
+    item_data = uj(row["item_json"])
+    return True, f"🏷️ **{item_data.get('item_name','?')}** 입찰 완료! {bid:,}코인"
+
+
+async def set_auction_watch(uid: int, keyword: str) -> str:
+    await set_rank_score(uid, f"watch_{keyword}", 1, season="watch")
+    return f"🔔 '{keyword}' 알림이 등록되었습니다."
+
+
+async def add_bp_exp(uid: int, exp: int) -> Optional[str]:
+    row = await fetch_one("SELECT * FROM battlepass WHERE user_id=?", (uid,))
+    if not row:
+        await execute("INSERT INTO battlepass (user_id,season,exp) VALUES (?,?,?)", (uid, settings.season_number, exp))
+        return None
+    new_exp = row["exp"] + exp
+    new_lv = row["level"]
+    msg = None
+    while new_exp >= 100:
+        new_exp -= 100
+        new_lv += 1
+        reward = BP_REWARDS.get(new_lv)
+        if reward:
+            await add_item(uid, reward["free"])
+            if row["premium"]:
+                await add_item(uid, reward["premium"])
+            msg = f"🎫 배틀패스 Lv.{new_lv} 달성!"
+    await execute("UPDATE battlepass SET level=?,exp=? WHERE user_id=?", (new_lv, new_exp, uid))
+    return msg
+
+
+async def propose_marriage(p1: PlayerRecord, p2_id: int) -> Tuple[bool, str]:
+    if p1.partner_id:
+        return False, "이미 결혼한 상태입니다."
+    row = await fetch_one("SELECT partner_id FROM players WHERE user_id=?", (p2_id,))
+    if not row:
+        return False, "상대방을 찾을 수 없습니다."
+    if row["partner_id"]:
+        return False, "상대방이 이미 결혼한 상태입니다."
+    return True, "PENDING"
+
+
+async def confirm_marriage(p1_id: int, p2_id: int) -> str:
+    now = datetime.now(timezone.utc).isoformat()
+    await execute("UPDATE players SET partner_id=? WHERE user_id=?", (p2_id, p1_id))
+    await execute("UPDATE players SET partner_id=? WHERE user_id=?", (p1_id, p2_id))
+    await execute("INSERT OR REPLACE INTO marriages (user_id,partner_id,married_at) VALUES (?,?,?)", (p1_id, p2_id, now))
+    return "💍 결혼이 성사되었습니다! 축하합니다!"
+
+
+async def propose_brotherhood(p1: PlayerRecord, p2_id: int) -> Tuple[bool, str]:
+    if p1.brother_id:
+        return False, "이미 의형제가 있습니다."
+    row = await fetch_one("SELECT user_id FROM players WHERE user_id=?", (p2_id,))
+    if not row:
+        return False, "상대방을 찾을 수 없습니다."
+    return True, "PENDING"
+
+
+async def confirm_brotherhood(p1_id: int, p2_id: int) -> str:
+    await execute("UPDATE players SET brother_id=? WHERE user_id=?", (p2_id, p1_id))
+    await execute("UPDATE players SET brother_id=? WHERE user_id=?", (p1_id, p2_id))
+    return "🤝 의형제를 맺었습니다!"
+
+
+async def accept_quest(uid: int, quest_code: str) -> Tuple[bool, str]:
+    if quest_code not in QUEST_DATA:
+        return False, "존재하지 않는 퀘스트입니다."
+    row = await fetch_one("SELECT id,completed FROM quests WHERE user_id=? AND quest_code=?", (uid, quest_code))
+    if row:
+        return False, "이미 진행 중이거나 완료한 퀘스트입니다."
+    await execute("INSERT INTO quests (user_id,quest_code) VALUES (?,?)", (uid, quest_code))
+    q = QUEST_DATA[quest_code]
+    return True, f"📜 퀘스트 수락: **{q['name']}**\n{q['desc']}"
+
+
+async def check_quest_progress(uid: int, quest_type: str, value: int = 1) -> Optional[str]:
+    rows = await fetch_all("SELECT * FROM quests WHERE user_id=? AND completed=0", (uid,))
+    msgs = []
+    for row in rows:
+        q = QUEST_DATA.get(row["quest_code"])
+        if not q or q["type"] != quest_type:
+            continue
+        new_prog = row["progress"] + value
+        if new_prog >= q["target"]:
+            await execute("UPDATE quests SET progress=?,completed=1 WHERE id=?", (q["target"], row["id"]))
+            prow = await fetch_one("SELECT * FROM players WHERE user_id=?", (uid,))
+            if prow:
+                pr = PlayerRecord.from_row(prow)
+                pr.coins += q["reward_coins"]
+                await add_exp(pr, q["reward_exp"])
+                await add_item(uid, q["reward_item"])
+                await save_player(pr)
+            msgs.append(f"✅ 퀘스트 완료: **{q['name']}**! 💰+{q['reward_coins']} EXP+{q['reward_exp']}")
+        else:
+            await execute("UPDATE quests SET progress=? WHERE id=?", (new_prog, row["id"]))
+    return "\n".join(msgs) if msgs else None
+
+
+async def check_achievements(p: PlayerRecord) -> List[str]:
+    ensure_state_defaults(p)
+    earned = []
+    checks = {
+        "몬스터 헌터": p.state.get("kill_count", 0) >= 100,
+        "탐험가": p.state.get("move_count", 0) >= 1000,
+        "낚시왕": p.state.get("fish_count", 0) >= 100,
+        "레이드 영웅": p.state.get("raid_count", 0) >= 10,
+        "PVP 챔피언": p.state.get("pvp_win", 0) >= 50,
+        "장인": p.state.get("craft_count", 0) >= 20,
+        "부자": p.coins >= 1_000_000,
+    }
+    for title, cond in checks.items():
+        if cond and title not in p.achievements:
+            p.achievements.append(title)
+            earned.append(title)
+    if earned:
+        await save_player(p)
+    return earned
+
+
+async def enter_house(p: PlayerRecord) -> Tuple[bool, str]:
+    is_house_tile = (p.x + p.y) % 23 == 0
+    row = await fetch_one("SELECT * FROM houses WHERE x=? AND y=?", (p.x, p.y))
+    if not is_house_tile and not row:
+        return False, "이 위치에 집이 없습니다."
+    if row:
+        if row["owner_id"] == p.user_id:
+            furn = uj(row["furniture_json"])
+            return True, f"🏠 **내 집에 입장했습니다!**\n가구: {', '.join(furn) if furn else '없음'}"
+        owner = await fetch_one("SELECT username FROM players WHERE user_id=?", (row["owner_id"],))
+        return True, f"🏠 **{owner['username'] if owner else '알 수 없음'}의 집에 방문했습니다!**"
+    return True, "🏠 빈 집이 있습니다! 구매하시겠습니까? (💰 5,000코인)"
+
+
+async def buy_house(p: PlayerRecord) -> Tuple[bool, str]:
+    if p.coins < 5000:
+        return False, "코인이 부족합니다. (필요: 5,000)"
+    row = await fetch_one("SELECT * FROM houses WHERE x=? AND y=?", (p.x, p.y))
+    if row:
+        return False, "이미 누군가의 집입니다."
+    p.coins -= 5000
+    await execute("INSERT INTO houses (x,y,owner_id) VALUES (?,?,?)", (p.x, p.y, p.user_id))
+    await save_player(p)
+    return True, f"🏠 집을 구매했습니다! ({p.x},{p.y})"
+
+
+async def rest_at_home(p: PlayerRecord) -> Tuple[bool, str]:
+    row = await fetch_one("SELECT * FROM houses WHERE owner_id=?", (p.user_id,))
+    if not row:
+        return False, "소유한 집이 없습니다."
+    p.hp = p.max_hp
+    p.mp = p.max_mp
+    p.stamina = p.max_stamina
+    await save_player(p)
+    return True, "🏠 집에서 휴식! HP/MP/스태미나 완전 회복!"
+
+# ═══════════════════════════════════════════════════════════════════════
+# UI - 공용 로비 / 메인 게임
+# ═══════════════════════════════════════════════════════════════════════
+class HelpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="🗺️ 이동/탐험", style=discord.ButtonStyle.primary)
+    async def help_move(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_message("**🗺️ 이동/탐험**\n• 방향 버튼으로 이동\n• NPC/집 상호작용\n• 미니맵 확인\n• /rpg는 자판기를 열고 실제 게임은 개인 창으로 열립니다.", ephemeral=True)
+
+    @discord.ui.button(label="⚔️ 전투/PVP", style=discord.ButtonStyle.danger)
+    async def help_battle(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_message("**⚔️ 전투/PVP**\n• 일반 사냥 / 던전 / 스킬 사용\n• PVP는 버튼으로 도전 요청 가능\n• PVP 킬 수는 랭킹보드에 기록됩니다.", ephemeral=True)
+
+    @discord.ui.button(label="🎓 전직", style=discord.ButtonStyle.success)
+    async def help_job(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_message("**🎓 전직**\n• 일반/히든/시크릿 전직 존재\n• 조건 충족 시 직접 전직\n• 이미 전직한 플레이어에게 배워서 전직 가능", ephemeral=True)
+
+
+class BugReportModal(discord.ui.Modal, title="버그 제보"):
+    bug = discord.ui.TextInput(label="버그 내용", style=discord.TextStyle.long, max_length=500)
+
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        await execute("INSERT INTO error_logs (guild_id,error_text) VALUES (?,?)", (str(i.guild_id) if i.guild_id else "DM", f"[{i.user}] {self.bug.value}"))
+        if settings.bug_channel_id:
+            ch = i.client.get_channel(settings.bug_channel_id)
+            if ch:
+                try:
+                    await ch.send(f"🐛 **버그 제보** by {i.user.mention}\n{self.bug.value}")
+                except Exception:
+                    pass
+        await i.followup.send("✅ 버그 제보가 접수되었습니다.", ephemeral=True)
+
+
+class InviteRegisterModal(discord.ui.Modal, title="초대 코드 등록"):
+    code = discord.ui.TextInput(label="초대 코드", max_length=20)
+
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name, str(i.guild_id) if i.guild_id else None)
+        if p.invited_by:
+            await i.followup.send("이미 초대 코드를 등록했습니다.", ephemeral=True)
+            return
+        inviter = await fetch_one("SELECT * FROM players WHERE invite_code=?", (self.code.value.upper(),))
+        if not inviter:
+            await i.followup.send("유효하지 않은 초대 코드입니다.", ephemeral=True)
+            return
+        if inviter["user_id"] == p.user_id:
+            await i.followup.send("자신의 초대 코드는 사용할 수 없습니다.", ephemeral=True)
+            return
+        p.invited_by = inviter["user_id"]
+        p.coins += 500
+        p.gems += 5
+        await save_player(p)
+        await execute("UPDATE players SET coins=coins+500, gems=gems+5 WHERE user_id=?", (inviter["user_id"],))
+        await i.followup.send("✅ 초대 코드 등록 완료! 💰+500 💎+5 지급!", ephemeral=True)
+
+
+class RPGLobbyView(discord.ui.View):
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="A1 게임 시작", style=discord.ButtonStyle.success, row=0)
+    async def start_game(self, i: discord.Interaction, b: discord.ui.Button):
+        p = await ensure_player(i.user.id, i.user.display_name, str(i.guild_id) if i.guild_id else None)
+        if p.tutorial_step == 0:
+            p.tutorial_step = 1
+            await save_player(p)
+        embed = build_rpg_embed(p)
+        view = RPGMainView(self.cog, p.user_id)
+        await i.response.send_message(
+            embed=embed,
+            view=view,
+            ephemeral=True,
+        )
+        await view.start_refresh(i)
+
+    @discord.ui.button(label="A2 전체 랭킹", style=discord.ButtonStyle.primary, row=0)
+    async def show_ranking(self, i: discord.Interaction, b: discord.ui.Button):
+        rows = await fetch_all("SELECT username,level,coins FROM players ORDER BY level DESC, coins DESC LIMIT 10")
+        lines = ["**🏆 글로벌 랭킹 (레벨 기준)**"]
+        for idx, r in enumerate(rows, 1):
+            lines.append(f"{idx}. **{r['username']}** | Lv.{r['level']} | 💰{r['coins']:,}")
+        await i.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="B1 PVP 킬보드", style=discord.ButtonStyle.danger, row=1)
+    async def show_pvp_board(self, i: discord.Interaction, b: discord.ui.Button):
+        rows = await get_leaderboard("pvp_kill", 10)
+        if not rows:
+            await i.response.send_message("아직 PVP 기록이 없습니다.", ephemeral=True)
+            return
+        lines = ["**⚔️ PVP 킬 랭킹보드**"]
+        for idx, r in enumerate(rows, 1):
+            lines.append(f"{idx}. **{r['username']}** | 킬 {r['score']} | Lv.{r['level']}")
+        await i.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="B2 도움말", style=discord.ButtonStyle.secondary, row=1)
+    async def help_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_message("❓ **RPG 자판기 도움말**", view=HelpView(), ephemeral=True)
+
+    @discord.ui.button(label="C1 초대", style=discord.ButtonStyle.secondary, row=2)
+    async def invite_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        p = await ensure_player(i.user.id, i.user.display_name, str(i.guild_id) if i.guild_id else None)
+        if not p.invite_code:
+            p.invite_code = uuid.uuid4().hex[:8].upper()
+            await save_player(p)
+        invited = await fetch_one("SELECT COUNT(*) as cnt FROM players WHERE invited_by=?", (p.user_id,))
+        await i.response.send_message(
+            f"**🎟️ 초대 코드: `{p.invite_code}`**\n초대한 친구 수: {invited['cnt'] if invited else 0}명\n친구는 버튼의 코드 등록으로 입력 가능!",
+            ephemeral=True,
+            view=InviteLobbyView(),
+        )
+
+    @discord.ui.button(label="C2 버그 제보", style=discord.ButtonStyle.secondary, row=2)
+    async def bug_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_modal(BugReportModal())
+
+
+class InviteLobbyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="초대 코드 등록", style=discord.ButtonStyle.primary)
+    async def register(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_modal(InviteRegisterModal())
+
+
+class RPGMainView(discord.ui.View):
+    def __init__(self, cog, uid: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.uid = uid
+
+    async def start_refresh(self, interaction: discord.Interaction):
+        row = await fetch_one("SELECT auto_refresh FROM player_settings WHERE user_id=?", (self.uid,))
+        if row and row["auto_refresh"] and not self.bot_refresh.is_running():
+            self.bot_refresh.start(interaction)
+
+    @tasks.loop(seconds=5)
+    async def bot_refresh(self, interaction: discord.Interaction):
+        try:
+            p = await ensure_player(self.uid, interaction.user.display_name)
+            await interaction.edit_original_response(embed=build_rpg_embed(p), view=self)
+        except Exception:
+            if self.bot_refresh.is_running():
+                self.bot_refresh.cancel()
+
+    async def _check(self, i: discord.Interaction) -> bool:
+        if i.user.id != self.uid:
+            await i.response.send_message("자신의 캐릭터만 조작 가능합니다!", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh_map(self, i: discord.Interaction, extra: str = ""):
+        p = await ensure_player(i.user.id, i.user.display_name)
+        embed = build_rpg_embed(p, extra_status=extra)
+        await i.edit_original_response(embed=embed, view=self)
+
+    async def _do_move(self, i: discord.Interaction, direction: str):
+        await i.response.defer()
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if p.stamina <= 0:
+            await self._refresh_map(i, "⚡ 스태미나가 부족합니다!")
+            return
+        ok, msg = await try_move(p, direction)
+        await self._refresh_map(i, msg)
+
+    @discord.ui.button(label="↑", style=discord.ButtonStyle.primary, row=0)
+    async def move_up(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await self._do_move(i, "W")
+
+    @discord.ui.button(label="←", style=discord.ButtonStyle.primary, row=1)
+    async def move_left(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await self._do_move(i, "A")
+
+    @discord.ui.button(label="↓", style=discord.ButtonStyle.primary, row=1)
+    async def move_down(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await self._do_move(i, "S")
+
+    @discord.ui.button(label="→", style=discord.ButtonStyle.primary, row=1)
+    async def move_right(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await self._do_move(i, "D")
+
+    @discord.ui.button(label="🗺️ 미니맵", style=discord.ButtonStyle.secondary, row=0)
+    async def minimap(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        await i.response.send_message(render_minimap(p), ephemeral=True)
+
+    @discord.ui.button(label="🏠 상호작용", style=discord.ButtonStyle.secondary, row=0)
+    async def interact(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        for npc_key, npc in NPCS.items():
+            if abs(p.x - npc["x"]) <= 1 and abs(p.y - npc["y"]) <= 1:
+                await i.response.send_message(f"💬 **{npc['name']}**: {npc['dialogue']}", view=NPCView(self.cog, p.user_id, npc_key, npc), ephemeral=True)
+                return
+        ok, msg = await enter_house(p)
+        if ok and "입장" in msg:
+            p.state["in_house"] = True
+            await save_player(p)
+            await self._refresh_map(i)
+            await i.followup.send(msg, view=HouseView(self.cog, p.user_id), ephemeral=True)
+            return
+        await i.response.send_message(msg, view=HouseView(self.cog, p.user_id) if ok else None, ephemeral=True)
+
+    @discord.ui.button(label="⚔️ 전투", style=discord.ButtonStyle.danger, row=2)
+    async def battle(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if p.hp <= 0:
+            await i.response.send_message("HP가 없습니다! 회복하세요.", ephemeral=True)
+            return
+        await i.response.send_message("⚔️ 전투 유형을 선택하세요:", view=BattleSelectView(self.cog, p.user_id), ephemeral=True)
+
+    @discord.ui.button(label="🎒 인벤토리", style=discord.ButtonStyle.success, row=2)
+    async def inventory(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        rows = await fetch_all("SELECT * FROM inventory_items WHERE user_id=? LIMIT 20", (self.uid,))
+        if not rows:
+            await i.response.send_message("인벤토리가 비어있습니다.", ephemeral=True)
+            return
+        lines = ["**🎒 인벤토리**"]
+        for r in rows:
+            ench = f" (+{r['enchant_level']})" if r["enchant_level"] > 0 else ""
+            lines.append(f"`ID:{r['id']}` {r['item_name']}{ench} x{r['qty']}")
+        await i.response.send_message("\n".join(lines), view=InventoryActionView(self.cog, self.uid), ephemeral=True)
+
+    @discord.ui.button(label="📊 스탯", style=discord.ButtonStyle.success, row=2)
+    async def stat(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        title = f"[{p.title}] " if p.title else ""
+        txt = (
+            f"**{title}{p.username}의 스탯**\n"
+            f"직업: {p.job} | Lv.{p.level} | EXP: {p.exp}/{p.level*100}\n"
+            f"❤️ HP: {p.hp}/{p.max_hp} | 💙 MP: {p.mp}/{p.max_mp}\n"
+            f"⚔️ 공격: {p.attack} | 🛡️ 방어: {p.defense} | 🎯 치명타: {p.crit}%\n"
+            f"💰 코인: {p.coins:,} | 💎 젬: {p.gems}\n"
+            f"✨ 특성 포인트: {p.skill_points} (📊 스탯 → ✨ 특성에서 사용)\n"
+            f"⚔️ PVP 킬: {p.state.get('pvp_kill',0)} | 승: {p.state.get('pvp_win',0)} | 패: {p.state.get('pvp_loss',0)}\n"
+            f"🏆 업적: {', '.join(p.achievements) if p.achievements else '없음'}\n\n"
+            f"**🎽 장비**\n{get_equipped_summary(p)}"
+        )
+        await i.response.send_message(txt, view=StatMenuView(self.cog, self.uid), ephemeral=True)
+
+    @discord.ui.button(label="🎮 미니게임", style=discord.ButtonStyle.secondary, row=3)
+    async def minigame(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await i.response.send_message("🎮 미니게임을 선택하세요:", view=MinigameView(self.cog, self.uid), ephemeral=True)
+
+    @discord.ui.button(label="🏪 거래소", style=discord.ButtonStyle.secondary, row=3)
+    async def auction(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await i.response.send_message("🏪 거래소 메뉴", view=AuctionView(self.cog, self.uid), ephemeral=True)
+
+    @discord.ui.button(label="🐲 레이드", style=discord.ButtonStyle.danger, row=4)
+    async def raid_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        raid_id, boss = await create_raid(random.randint(0, len(BOSSES)-1))
+        await i.response.send_message(
+            f"🐲 **레이드 보스 등장!**\n보스: {boss['name']}\nHP: {boss['hp']:,}\n레이드 ID: `{raid_id}`",
+            view=RaidView(self.cog, self.uid, raid_id), ephemeral=True,
+        )
+
+    @discord.ui.button(label="🌍 월드보스", style=discord.ButtonStyle.danger, row=3)
+    async def world_boss_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await self._check(i):
+            return
+        await i.response.defer()
+        row = await get_active_world_boss()
+        if not row:
+            await i.followup.send("🌍 현재 활성화된 월드보스가 없습니다. 주기적으로 서버에 등장하니 공지 채널을 확인하세요!", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title=f"🌍 월드보스: {row['boss_name']}",
+            description=f"HP: {row['boss_hp']:,} / {row['boss_max_hp']:,}\n누구나 참여해 함께 공격할 수 있습니다!",
+            color=discord.Color.red(),
+        )
+        await i.followup.send(embed=embed, view=WorldBossView(row["raid_id"]))
+
+    @discord.ui.button(label="🤝 소셜", style=discord.ButtonStyle.success, row=4)
+    async def social(self, i: discord.Interaction, b: discord.ui.Button):
+        if await self._check(i):
+            await i.response.send_message("🤝 소셜 메뉴", view=SocialMenuView(self.cog, self.uid), ephemeral=True)
+
+    @discord.ui.button(label="❓ 도움말", style=discord.ButtonStyle.secondary, row=4)
+    async def help_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.send_message("❓ 도움말", view=HelpView(), ephemeral=True)
+
+class RaidView(discord.ui.View):
+    def __init__(self, cog, uid, raid_id):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.uid = uid
+        self.raid_id = raid_id
+
+    @discord.ui.button(label="🐲 참가", style=discord.ButtonStyle.primary)
+    async def join(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await join_raid(self.raid_id, p)
+        await i.followup.send(msg, ephemeral=True)
+
+    @discord.ui.button(label="⚔️ 공격", style=discord.ButtonStyle.danger)
+    async def attack(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await attack_raid(self.raid_id, p)
+        if ok and "클리어" in msg:
+            self.stop()
+        await i.followup.send(msg, ephemeral=True)
+
+
+class WorldBossView(discord.ui.View):
+    """서버 공지 채널이나 버튼으로 열람 시 게시되는, 누구나 참여 가능한 월드보스 전투창."""
+    def __init__(self, raid_id):
+        super().__init__(timeout=None)
+        self.raid_id = raid_id
+
+    @discord.ui.button(label="⚔️ 공격하기", style=discord.ButtonStyle.danger, custom_id="worldboss_attack")
+    async def attack(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if p.hp <= 0:
+            await i.followup.send("HP가 없습니다! 회복 후 다시 시도하세요.", ephemeral=True)
+            return
+        await join_raid(self.raid_id, p)
+        ok, msg = await attack_raid(self.raid_id, p)
+        if not ok:
+            await i.followup.send(msg, ephemeral=True)
+            return
+        await i.followup.send(msg, ephemeral=True)
+        if "클리어" in msg:
+            for item in self.children:
+                item.disabled = True
+            self.stop()
+            try:
+                await i.message.edit(content="🎉 월드보스가 처치되었습니다!", view=self)
+            except Exception:
+                pass
+
+
+class BattleSelectView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+
+    @discord.ui.button(label="🐺 일반 사냥", style=discord.ButtonStyle.danger)
+    async def hunt(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        result = await fight_monster(p, random.choice(MONSTERS))
+        bp_msg = await add_bp_exp(p.user_id, 5)
+        ach = await check_achievements(p)
+        extra = []
+        if bp_msg: extra.append(bp_msg)
+        if ach: extra.append("🏆 새 업적: " + ", ".join(ach))
+        await i.followup.send(result["log"] + ("\n" + "\n".join(extra) if extra else ""), ephemeral=True)
+
+    @discord.ui.button(label="🏰 던전", style=discord.ButtonStyle.danger)
+    async def dungeon(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        floor = p.state.get("dungeon_floor", 1)
+        result = await dungeon_fight(p, floor)
+        if result["win"]:
+            if floor >= 5:
+                boss = await dungeon_boss_fight(p)
+                p.state["dungeon_floor"] = 1
+                await save_player(p)
+                await i.followup.send(result["log"] + "\n\n" + boss["log"], ephemeral=True)
+            else:
+                p.state["dungeon_floor"] = floor + 1
+                await save_player(p)
+                await i.followup.send(result["log"] + f"\n\n🏰 다음 층: **{floor+1}층**", ephemeral=True)
+        else:
+            p.state["dungeon_floor"] = 1
+            await save_player(p)
+            await i.followup.send(result["log"], ephemeral=True)
+
+    @discord.ui.button(label="⚡ 스킬 사용", style=discord.ButtonStyle.primary)
+    async def skill(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        skills = SKILL_TREE.get(job_skill_key(p.job), {})
+        if not skills:
+            await i.response.send_message("현재 직업에 사용할 수 있는 스킬이 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("⚡ 스킬을 선택하세요:", view=SkillView(self.cog, self.uid, skills), ephemeral=True)
+
+    @discord.ui.button(label="⚔️ PVP", style=discord.ButtonStyle.secondary)
+    async def pvp(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.send_message("⚔️ PVP 메뉴", view=PVPMenuView(self.cog, self.uid), ephemeral=True)
+
+
+class SkillView(discord.ui.View):
+    def __init__(self, cog, uid, skills: dict):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+        for code, sk in list(skills.items())[:5]:
+            btn = discord.ui.Button(label=sk["name"][:20], style=discord.ButtonStyle.primary)
+            btn.callback = self._make_cb(code, sk)
+            self.add_item(btn)
+
+    def _make_cb(self, code, sk):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            if p.mp < sk.get("mp", 0):
+                await i.followup.send(f"MP 부족! (필요: {sk['mp']})", ephemeral=True)
+                return
+            p.mp -= sk.get("mp", 0)
+            mob = random.choice(MONSTERS)
+            dmg = int(max(1, p.attack * sk.get("mult", 1.0) - mob["def"]))
+            mob_hp = mob["hp"] - dmg
+            heal = sk.get("heal", 0)
+            if heal:
+                p.hp = min(p.max_hp, p.hp + heal)
+            msg = f"⚡ **{sk['name']}** 발동!\n{mob['name']}에게 **{dmg}** 데미지!"
+            if heal:
+                msg += f"\n💚 HP +{heal}"
+            if mob_hp <= 0:
+                p.coins += mob["coins"]
+                await add_exp(p, mob["exp"])
+                msg += f"\n🏆 처치! 💰+{mob['coins']}"
+            await save_player(p)
+            await i.followup.send(msg, ephemeral=True)
+        return cb
+
+
+class InventoryActionView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+
+    @discord.ui.button(label="💊 포션 사용", style=discord.ButtonStyle.success)
+    async def use_potion(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        row = await fetch_one("SELECT * FROM inventory_items WHERE user_id=? AND item_type='소비' ORDER BY id LIMIT 1", (p.user_id,))
+        if not row:
+            await i.followup.send("사용 가능한 소비 아이템이 없습니다.", ephemeral=True)
+            return
+        item = ITEM_CATALOG.get(row["item_code"])
+        if item and item.meta.get("heal"):
+            p.hp = min(p.max_hp, p.hp + item.meta["heal"])
+        elif item and item.meta.get("mp_restore"):
+            p.mp = min(p.max_mp, p.mp + item.meta["mp_restore"])
+        elif item and item.meta.get("teleport") == "town":
+            p.x, p.y = 100, 100
+            p.biome = _get_biome(100, 100)
+        await save_player(p)
+        if row["qty"] <= 1:
+            await execute("DELETE FROM inventory_items WHERE id=?", (row["id"],))
+        else:
+            await execute("UPDATE inventory_items SET qty=qty-1 WHERE id=?", (row["id"],))
+        await i.followup.send(f"✅ {row['item_name']} 사용!", ephemeral=True)
+
+    @discord.ui.button(label="💎 강화", style=discord.ButtonStyle.primary)
+    async def enchant(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        rows = await fetch_all("SELECT * FROM inventory_items WHERE user_id=? AND item_type IN ('무기','방어구') LIMIT 5", (i.user.id,))
+        if not rows:
+            await i.response.send_message("강화할 장비가 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("💎 강화할 아이템을 선택하세요:", view=EnchantSelectView(self.cog, self.uid, rows), ephemeral=True)
+
+    @discord.ui.button(label="⚔️ 장착", style=discord.ButtonStyle.primary)
+    async def equip(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        rows = await fetch_all("SELECT * FROM inventory_items WHERE user_id=? AND item_type IN ('무기','방어구') LIMIT 10", (i.user.id,))
+        if not rows:
+            await i.response.send_message("장착할 장비가 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("⚔️ 장착할 아이템을 선택하세요:", view=EquipSelectView(self.cog, self.uid, rows), ephemeral=True)
+
+    @discord.ui.button(label="🏪 거래소 등록", style=discord.ButtonStyle.secondary)
+    async def list_item(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        rows = await fetch_all("SELECT * FROM inventory_items WHERE user_id=? LIMIT 5", (i.user.id,))
+        if not rows:
+            await i.response.send_message("등록할 아이템이 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("📦 거래소에 등록할 아이템을 선택하세요:", view=AuctionListView(self.cog, self.uid, rows), ephemeral=True)
+
+
+class EquipSelectView(discord.ui.View):
+    def __init__(self, cog, uid, rows):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for row in rows:
+            slot = resolve_slot(row["item_type"], row["item_code"])
+            slot_kor = {"weapon": "무기", "head": "투구", "body": "갑옷", "gloves": "장갑", "boots": "신발"}.get(slot, slot)
+            btn = discord.ui.Button(label=f"[{slot_kor}] {row['item_name'][:16]}", style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_cb(row, slot)
+            self.add_item(btn)
+
+    def _make_cb(self, item_row, slot):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            msg = await equip_item(p, slot, item_row)
+            await i.followup.send(msg, ephemeral=True)
+        return cb
+
+
+class EnchantSelectView(discord.ui.View):
+    def __init__(self, cog, uid, rows):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for row in rows[:5]:
+            ench = f"+{row['enchant_level']}" if row["enchant_level"] > 0 else ""
+            btn = discord.ui.Button(label=f"{row['item_name'][:15]}{ench}", style=discord.ButtonStyle.primary)
+            btn.callback = self._make_cb(row["id"])
+            self.add_item(btn)
+
+    def _make_cb(self, inv_id):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            ok, msg = await enchant_item(i.user.id, inv_id)
+            await i.followup.send(msg, ephemeral=True)
+        return cb
+
+
+class AuctionPriceModal(discord.ui.Modal, title="거래소 등록 가격 설정"):
+    price = discord.ui.TextInput(label="시작 가격 (코인)", placeholder="예: 1000", min_length=1, max_length=10)
+    def __init__(self, uid, inv_id):
+        super().__init__()
+        self.uid = uid
+        self.inv_id = inv_id
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            min_bid = int(self.price.value)
+        except ValueError:
+            await i.followup.send("올바른 숫자를 입력하세요.", ephemeral=True)
+            return
+        ok, msg = await list_auction(self.uid, self.inv_id, min_bid)
+        await i.followup.send(msg, ephemeral=True)
+
+
+class AuctionListView(discord.ui.View):
+    def __init__(self, cog, uid, rows):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for row in rows[:5]:
+            btn = discord.ui.Button(label=row["item_name"][:20], style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_cb(row["id"])
+            self.add_item(btn)
+    def _make_cb(self, inv_id):
+        async def cb(i: discord.Interaction):
+            if i.user.id == self.uid:
+                await i.response.send_modal(AuctionPriceModal(self.uid, inv_id))
+        return cb
+
+
+class BidModal(discord.ui.Modal, title="입찰"):
+    bid = discord.ui.TextInput(label="입찰 금액 (코인)", min_length=1, max_length=10)
+    def __init__(self, uid, auction_id):
+        super().__init__()
+        self.uid = uid
+        self.auction_id = auction_id
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            bid = int(self.bid.value)
+        except ValueError:
+            await i.followup.send("올바른 숫자를 입력하세요.", ephemeral=True)
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await bid_auction(p, self.auction_id, bid)
+        await i.followup.send(msg, ephemeral=True)
+
+
+class AuctionBidView(discord.ui.View):
+    def __init__(self, cog, uid, rows):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for row in rows[:5]:
+            item = uj(row["item_json"])
+            btn = discord.ui.Button(label=f"입찰: {item.get('item_name','?')[:15]}", style=discord.ButtonStyle.danger)
+            btn.callback = self._make_cb(row["id"])
+            self.add_item(btn)
+    def _make_cb(self, auction_id):
+        async def cb(i: discord.Interaction):
+            if i.user.id == self.uid:
+                await i.response.send_modal(BidModal(self.uid, auction_id))
+        return cb
+
+
+class AuctionWatchModal(discord.ui.Modal, title="거래소 알림 설정"):
+    keyword = discord.ui.TextInput(label="아이템 키워드", max_length=20)
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        await i.followup.send(await set_auction_watch(i.user.id, self.keyword.value), ephemeral=True)
+
+
+class AuctionView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.uid = uid
+
+    @discord.ui.button(label="📋 매물 목록", style=discord.ButtonStyle.primary)
+    async def list_items(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        rows = await fetch_all("SELECT * FROM auction_house WHERE end_at>? ORDER BY id DESC LIMIT 10", (now,))
+        if not rows:
+            await i.response.send_message("현재 거래소에 매물이 없습니다.", ephemeral=True)
+            return
+        lines = ["**🏪 거래소 매물**"]
+        for r in rows:
+            item = uj(r["item_json"])
+            lines.append(f"`ID:{r['id']}` {item.get('item_name','?')} | 현재가: {r['current_bid']:,}💰")
+        await i.response.send_message("\n".join(lines), view=AuctionBidView(None, self.uid, rows), ephemeral=True)
+
+    @discord.ui.button(label="🔔 알림 설정", style=discord.ButtonStyle.secondary)
+    async def watch(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(AuctionWatchModal())
+
+
+class AppearanceModal(discord.ui.Modal, title="외형 커스터마이징"):
+    color = discord.ui.TextInput(label="캐릭터 색상", max_length=20)
+    accessory = discord.ui.TextInput(label="악세서리", max_length=20, required=False)
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        p.appearance = {"color": self.color.value, "accessory": self.accessory.value or "없음"}
+        await save_player(p)
+        await i.followup.send(f"🎨 외형 변경 완료!\n색상: {self.color.value} | 악세서리: {self.accessory.value or '없음'}", ephemeral=True)
+
+
+class TitleSelectView(discord.ui.View):
+    def __init__(self, cog, uid, titles: list):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for title in titles[:8]:
+            btn = discord.ui.Button(label=title, style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_cb(title)
+            self.add_item(btn)
+    def _make_cb(self, title):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            p.title = title
+            await save_player(p)
+            await i.followup.send(f"🏷️ 칭호를 **[{title}]** 으로 변경했습니다!", ephemeral=True)
+        return cb
+
+
+class TeachJobModal(discord.ui.Modal, title="플레이어에게 배우기"):
+    teacher_id = discord.ui.TextInput(label="스승 유저 ID", max_length=20)
+    def __init__(self, cog, student_uid):
+        super().__init__()
+        self.cog = cog
+        self.student_uid = student_uid
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            tid = int(self.teacher_id.value)
+        except ValueError:
+            await i.followup.send("올바른 유저 ID를 입력하세요.", ephemeral=True)
+            return
+        teacher_row = await fetch_one("SELECT * FROM players WHERE user_id=?", (tid,))
+        if not teacher_row:
+            await i.followup.send("해당 스승을 찾을 수 없습니다.", ephemeral=True)
+            return
+        teacher = PlayerRecord.from_row(teacher_row)
+        if teacher.job == "초보자":
+            await i.followup.send("스승이 아직 전직하지 않았습니다.", ephemeral=True)
+            return
+        req_id = uuid.uuid4().hex[:8]
+        self.cog._teach_requests[req_id] = {"teacher_id": tid, "student_id": self.student_uid, "job": teacher.job, "channel_id": i.channel_id}
+        await i.followup.send(f"전직 전수 요청이 생성되었습니다. <@{tid}> 님이 수락하면 **{teacher.job}** 을 배울 수 있습니다.", ephemeral=True)
+        await i.channel.send(f"🎓 <@{tid}> 님, <@{self.student_uid}> 님이 **{teacher.job}** 전직 전수를 요청했습니다!", view=TeachJobConfirmView(self.cog, req_id))
+
+
+class JobCenterView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+
+    @discord.ui.button(label="일반 전직", style=discord.ButtonStyle.primary)
+    async def normal(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        await i.response.send_message("🎓 일반 전직", view=JobSelectView(self.cog, self.uid, "일반"), ephemeral=True)
+
+    @discord.ui.button(label="히든 전직", style=discord.ButtonStyle.success)
+    async def hidden(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.send_message("🕵️ 히든 전직", view=JobSelectView(self.cog, self.uid, "히든"), ephemeral=True)
+
+    @discord.ui.button(label="시크릿 전직", style=discord.ButtonStyle.danger)
+    async def secret(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.send_message("🔐 시크릿 전직", view=JobSelectView(self.cog, self.uid, "시크릿"), ephemeral=True)
+
+    @discord.ui.button(label="플레이어에게 배우기", style=discord.ButtonStyle.secondary)
+    async def learn_from_player(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(TeachJobModal(self.cog, self.uid))
+
+
+class JobSelectView(discord.ui.View):
+    def __init__(self, cog, uid, tier: str):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+        self.tier = tier
+        for name, info in JOB_DATA.items():
+            if info.get("tier") != tier:
+                continue
+            btn = discord.ui.Button(label=name[:20], style=discord.ButtonStyle.primary if tier == "일반" else discord.ButtonStyle.secondary)
+            btn.callback = self._make_cb(name)
+            self.add_item(btn)
+    def _make_cb(self, job_name):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            ok, reason = check_job_requirements(p, job_name)
+            if not ok:
+                await i.followup.send(f"❌ {job_name} 전직 불가: {reason}", ephemeral=True)
+                return
+            ok2, msg = await apply_job_change(p, job_name)
+            await i.followup.send(msg, ephemeral=True)
+        return cb
+
+
+class StatMenuView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+
+    @discord.ui.button(label="🎓 전직 센터", style=discord.ButtonStyle.primary)
+    async def change_job(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_message("🎓 전직 센터", view=JobCenterView(self.cog, self.uid), ephemeral=True)
+
+    @discord.ui.button(label="🏷️ 칭호 변경", style=discord.ButtonStyle.secondary)
+    async def change_title(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if not p.achievements:
+            await i.response.send_message("획득한 칭호가 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("🏷️ 칭호를 선택하세요:", view=TitleSelectView(self.cog, self.uid, p.achievements), ephemeral=True)
+
+    @discord.ui.button(label="🎨 외형 변경", style=discord.ButtonStyle.secondary)
+    async def appearance(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(AppearanceModal(self.uid))
+
+    @discord.ui.button(label="📜 퀘스트", style=discord.ButtonStyle.success)
+    async def quests(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        rows = await fetch_all("SELECT * FROM quests WHERE user_id=? AND completed=0", (self.uid,))
+        if not rows:
+            await i.response.send_message("진행 중인 퀘스트가 없습니다.", ephemeral=True)
+            return
+        lines = ["**📜 진행 중인 퀘스트**"]
+        for r in rows:
+            q = QUEST_DATA.get(r["quest_code"], {})
+            lines.append(f"• **{q.get('name', r['quest_code'])}**: {r['progress']}/{q.get('target', 1)}")
+        await i.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="🎫 배틀패스", style=discord.ButtonStyle.success)
+    async def battlepass(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        row = await fetch_one("SELECT * FROM battlepass WHERE user_id=?", (self.uid,))
+        if not row:
+            await i.response.send_message("배틀패스 정보가 없습니다.", ephemeral=True)
+            return
+        premium = "✅ 프리미엄" if row["premium"] else "❌ 무료"
+        lines = [f"**🎫 시즌 {row['season']} 배틀패스**", f"등급: {premium} | Lv.{row['level']} | EXP: {row['exp']}/100"]
+        await i.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="✨ 특성", style=discord.ButtonStyle.primary)
+    async def traits(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        lines = [f"**✨ 특성 트리** (보유 포인트: {p.skill_points})", "레벨업마다 1포인트를 얻습니다. 원하는 특성에 자유롭게 투자하세요.\n"]
+        for code, t in TRAITS.items():
+            lv = p.traits.get(code, 0)
+            lines.append(f"{t['name']} Lv.{lv}/{t['max']} — {t['desc']}")
+        await i.response.send_message("\n".join(lines), view=TraitView(self.cog, self.uid), ephemeral=True)
+
+
+class TraitView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+        for code, t in TRAITS.items():
+            btn = discord.ui.Button(label=f"{t['name']} +1", style=discord.ButtonStyle.success)
+            btn.callback = self._make_cb(code)
+            self.add_item(btn)
+
+    def _make_cb(self, trait_code):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            ok, msg = await invest_trait(p, trait_code)
+            await i.followup.send(msg, ephemeral=True)
+        return cb
+
+
+class RelationTargetModal(discord.ui.Modal):
+    target_id = discord.ui.TextInput(label="상대 유저 ID", max_length=20)
+    def __init__(self, cog, proposer_id: int, mode: str):
+        super().__init__(title="결혼 제안" if mode == "marry" else "의형제 제안")
+        self.cog = cog
+        self.proposer_id = proposer_id
+        self.mode = mode
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            tid = int(self.target_id.value)
+        except ValueError:
+            await i.followup.send("올바른 유저 ID를 입력하세요.", ephemeral=True)
+            return
+        p = await ensure_player(self.proposer_id, i.user.display_name)
+        if self.mode == "marry":
+            ok, msg = await propose_marriage(p, tid)
+            if not ok:
+                await i.followup.send(msg, ephemeral=True)
+                return
+            await i.channel.send(f"💍 <@{self.proposer_id}> 님이 <@{tid}> 님에게 결혼을 제안했습니다!", view=MarriageConfirmView(self.proposer_id, tid))
+        else:
+            ok, msg = await propose_brotherhood(p, tid)
+            if not ok:
+                await i.followup.send(msg, ephemeral=True)
+                return
+            await i.channel.send(f"🤝 <@{self.proposer_id}> 님이 <@{tid}> 님에게 의형제를 제안했습니다!", view=BrotherhoodConfirmView(self.proposer_id, tid))
+        await i.followup.send("요청을 보냈습니다. 상대방이 버튼으로 응답할 수 있습니다.", ephemeral=True)
+
+
+async def start_pvp_challenge(cog, i: discord.Interaction, challenger_id: int, tid: int):
+    """PVP 도전 요청을 생성하는 공용 로직 (모달/유저선택 공용)."""
+    if tid == challenger_id:
+        await i.followup.send("자기 자신에게 도전할 수 없습니다.", ephemeral=True)
+        return
+    row = await fetch_one("SELECT user_id FROM players WHERE user_id=?", (tid,))
+    if not row:
+        await i.followup.send("상대 플레이어를 찾을 수 없습니다. 먼저 게임을 시작한 유저여야 합니다.", ephemeral=True)
+        return
+    cid = uuid.uuid4().hex[:8]
+    cog._pvp_requests[cid] = {"challenger_id": challenger_id, "target_id": tid, "channel_id": i.channel_id}
+    await i.followup.send("PVP 도전 요청을 보냈습니다.", ephemeral=True)
+    await i.channel.send(f"⚔️ <@{challenger_id}> 님이 <@{tid}> 님에게 PVP를 신청했습니다!", view=PVPConfirmView(cog, cid))
+
+
+class PVPChallengeModal(discord.ui.Modal, title="PVP 도전"):
+    target_id = discord.ui.TextInput(label="상대 유저 ID", max_length=20)
+    def __init__(self, cog, challenger_id):
+        super().__init__()
+        self.cog = cog
+        self.challenger_id = challenger_id
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            tid = int(self.target_id.value)
+        except ValueError:
+            await i.followup.send("올바른 유저 ID를 입력하세요.", ephemeral=True)
+            return
+        await start_pvp_challenge(self.cog, i, self.challenger_id, tid)
+
+
+class PVPChallengeSelectView(discord.ui.View):
+    """유저 ID를 몰라도 서버 멤버 목록에서 바로 골라 도전할 수 있는 선택창."""
+    def __init__(self, cog, challenger_id: int):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.challenger_id = challenger_id
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="⚔️ 도전할 상대를 선택하세요", min_values=1, max_values=1)
+    async def pick_target(self, i: discord.Interaction, select: discord.ui.UserSelect):
+        if i.user.id != self.challenger_id:
+            await i.response.send_message("본인만 사용할 수 있습니다.", ephemeral=True)
+            return
+        await i.response.defer(ephemeral=True)
+        target = select.values[0]
+        await start_pvp_challenge(self.cog, i, self.challenger_id, target.id)
+        self.stop()
+
+
+class PVPMenuView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+    @discord.ui.button(label="⚔️ 플레이어 도전", style=discord.ButtonStyle.danger)
+    async def challenge(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_message(
+                "도전할 상대를 아래 목록에서 선택하세요. (유저 ID를 몰라도 됩니다)",
+                view=PVPChallengeSelectView(self.cog, self.uid),
+                ephemeral=True,
+            )
+    @discord.ui.button(label="✍️ ID로 도전", style=discord.ButtonStyle.secondary)
+    async def challenge_by_id(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(PVPChallengeModal(self.cog, self.uid))
+    @discord.ui.button(label="🏆 PVP 킬 랭킹", style=discord.ButtonStyle.secondary)
+    async def pvp_rank(self, i: discord.Interaction, b: discord.ui.Button):
+        rows = await get_leaderboard("pvp_kill", 10)
+        if not rows:
+            await i.response.send_message("아직 PVP 기록이 없습니다.", ephemeral=True)
+            return
+        lines = ["**⚔️ PVP 킬 랭킹보드**"]
+        for idx, r in enumerate(rows, 1):
+            lines.append(f"{idx}. **{r['username']}** | 킬 {r['score']} | Lv.{r['level']}")
+        await i.response.send_message("\n".join(lines), ephemeral=True)
+
+
+class SocialMenuView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+    @discord.ui.button(label="💍 결혼 제안", style=discord.ButtonStyle.primary)
+    async def marry(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(RelationTargetModal(self.cog, self.uid, "marry"))
+    @discord.ui.button(label="🤝 의형제 제안", style=discord.ButtonStyle.primary)
+    async def brotherhood(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(RelationTargetModal(self.cog, self.uid, "brother"))
+    @discord.ui.button(label="👋 인사", style=discord.ButtonStyle.secondary)
+    async def wave(self, i: discord.Interaction, b: discord.ui.Button):
+        p = await ensure_player(self.uid, i.user.display_name)
+        await i.response.send_message(f"👋 **{p.username}**이(가) 인사를 합니다!")
+    @discord.ui.button(label="💃 춤", style=discord.ButtonStyle.secondary)
+    async def dance(self, i: discord.Interaction, b: discord.ui.Button):
+        p = await ensure_player(self.uid, i.user.display_name)
+        await i.response.send_message(f"💃 **{p.username}**이(가) 신나게 춤을 춥니다!")
+    @discord.ui.button(label="🎟️ 초대/등록", style=discord.ButtonStyle.secondary)
+    async def invite(self, i: discord.Interaction, b: discord.ui.Button):
+        p = await ensure_player(self.uid, i.user.display_name)
+        if not p.invite_code:
+            p.invite_code = uuid.uuid4().hex[:8].upper()
+            await save_player(p)
+        invited_count = await fetch_one("SELECT COUNT(*) as cnt FROM players WHERE invited_by=?", (p.user_id,))
+        await i.response.send_message(f"**🎟️ 초대 코드: `{p.invite_code}`**\n초대한 친구 수: {invited_count['cnt'] if invited_count else 0}명", view=InviteLobbyView(), ephemeral=True)
+    @discord.ui.button(label="⚔️ PVP 랭킹", style=discord.ButtonStyle.danger)
+    async def pvp_rank(self, i: discord.Interaction, b: discord.ui.Button):
+        await PVPMenuView(self.cog, self.uid).pvp_rank(i, b)
+
+
+class QuestListView(discord.ui.View):
+    def __init__(self, cog, uid, quest_codes):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for qc in quest_codes[:5]:
+            btn = discord.ui.Button(label=QUEST_DATA.get(qc, {}).get("name", qc)[:20], style=discord.ButtonStyle.primary)
+            btn.callback = self._make_cb(qc)
+            self.add_item(btn)
+    def _make_cb(self, qc):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            ok, msg = await accept_quest(i.user.id, qc)
+            await i.followup.send(msg, ephemeral=True)
+        return cb
+
+
+class CraftView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.uid = uid
+        options = []
+        for code in list(CRAFT_RECIPES.keys())[:25]:
+            item = ITEM_CATALOG.get(code)
+            if item:
+                recipe = CRAFT_RECIPES[code]
+                mats = ", ".join(f"{ITEM_CATALOG.get(m, Item(m, m, '', '')).name}x{q}" for m, q in list(recipe["재료"].items())[:2])
+                options.append(discord.SelectOption(label=item.name[:100], description=f"💰{recipe['코인']:,} | {mats}"[:100], value=code))
+        select = discord.ui.Select(placeholder="⚒️ 제작할 아이템을 선택하세요", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, i: discord.Interaction):
+        if i.user.id != self.uid:
+            return
+        code = i.data["values"][0]
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await craft_item(p, code)
+        await i.followup.send(msg, ephemeral=True)
+
+
+class ShopView(discord.ui.View):
+    def __init__(self, cog, uid, shop_items):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for code in shop_items[:5]:
+            item = ITEM_CATALOG.get(code)
+            price = SHOP_ITEMS.get(code, {}).get("price", 0)
+            if item:
+                btn = discord.ui.Button(label=f"{item.name[:15]} ({price}💰)", style=discord.ButtonStyle.success)
+                btn.callback = self._make_cb(code, price)
+                self.add_item(btn)
+    def _make_cb(self, code, price):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            if p.coins < price:
+                await i.followup.send(f"코인 부족! (필요: {price:,})", ephemeral=True)
+                return
+            p.coins -= price
+            await add_item(p.user_id, code)
+            await save_player(p)
+            await i.followup.send(f"✅ **{ITEM_CATALOG[code].name}** 구매 완료! 💰 -{price:,}", ephemeral=True)
+        return cb
+
+
+class HouseView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.uid = uid
+    @discord.ui.button(label="🏠 집 구매", style=discord.ButtonStyle.success)
+    async def buy(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await buy_house(p)
+        await i.followup.send(msg, ephemeral=True)
+    @discord.ui.button(label="😴 집에서 휴식", style=discord.ButtonStyle.primary)
+    async def rest(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await rest_at_home(p)
+        await i.followup.send(msg, ephemeral=True)
+    @discord.ui.button(label="🚪 집 나가기", style=discord.ButtonStyle.secondary)
+    async def leave(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        p.state["in_house"] = False
+        await save_player(p)
+        await i.followup.send("집에서 나왔습니다.", ephemeral=True)
+
+
+class GuildCreateModal(discord.ui.Modal, title="길드 창설"):
+    name = discord.ui.TextInput(label="길드 이름", max_length=20)
+    notice = discord.ui.TextInput(label="길드 공지", max_length=100, required=False)
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if p.coins < 10000:
+            await i.followup.send("길드 창설 비용: 💰 10,000코인", ephemeral=True)
+            return
+        existing = await fetch_one("SELECT guild_name FROM guilds WHERE guild_name=?", (self.name.value,))
+        if existing:
+            await i.followup.send("이미 존재하는 길드 이름입니다.", ephemeral=True)
+            return
+        p.coins -= 10000
+        p.guild_id = self.name.value
+        await execute("INSERT INTO guilds (guild_name,owner_id,notice,members_json) VALUES (?,?,?,?)", (self.name.value, p.user_id, self.notice.value or "", j([p.user_id])))
+        await save_player(p)
+        await i.followup.send(f"🏰 **{self.name.value}** 길드 창설 완료!", ephemeral=True)
+
+
+class GuildJoinView(discord.ui.View):
+    def __init__(self, cog, uid, rows):
+        super().__init__(timeout=120)
+        self.uid = uid
+        for row in rows[:5]:
+            btn = discord.ui.Button(label=row["guild_name"][:20], style=discord.ButtonStyle.primary)
+            btn.callback = self._make_cb(row["guild_name"])
+            self.add_item(btn)
+    def _make_cb(self, guild_name):
+        async def cb(i: discord.Interaction):
+            if i.user.id != self.uid:
+                return
+            await i.response.defer(ephemeral=True)
+            p = await ensure_player(i.user.id, i.user.display_name)
+            row = await fetch_one("SELECT * FROM guilds WHERE guild_name=?", (guild_name,))
+            if not row:
+                await i.followup.send("길드를 찾을 수 없습니다.", ephemeral=True)
+                return
+            members = uj(row["members_json"])
+            if p.user_id not in members:
+                members.append(p.user_id)
+                await execute("UPDATE guilds SET members_json=? WHERE guild_name=?", (j(members), guild_name))
+            p.guild_id = guild_name
+            await save_player(p)
+            await i.followup.send(f"🏰 **{guild_name}** 길드에 가입했습니다!", ephemeral=True)
+        return cb
+
+
+class GuildView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.uid = uid
+    @discord.ui.button(label="🏰 길드 창설", style=discord.ButtonStyle.success)
+    async def create_guild(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(GuildCreateModal(self.uid))
+    @discord.ui.button(label="🔍 길드 가입", style=discord.ButtonStyle.primary)
+    async def join_guild(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        rows = await fetch_all("SELECT guild_name,owner_id FROM guilds LIMIT 10")
+        if not rows:
+            await i.response.send_message("등록된 길드가 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("🏰 길드 목록", view=GuildJoinView(None, self.uid, rows), ephemeral=True)
+    @discord.ui.button(label="📋 내 길드", style=discord.ButtonStyle.secondary)
+    async def my_guild(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if not p.guild_id:
+            await i.response.send_message("길드에 가입되어 있지 않습니다.", ephemeral=True)
+            return
+        row = await fetch_one("SELECT * FROM guilds WHERE guild_name=?", (p.guild_id,))
+        if not row:
+            await i.response.send_message("길드 정보를 찾을 수 없습니다.", ephemeral=True)
+            return
+        members = uj(row["members_json"])
+        await i.response.send_message(
+            f"**🏰 {row['guild_name']}**\n공지: {row['notice'] or '없음'}\n금고: 💰{row['treasury']:,}\n"
+            f"멤버: {len(members)}명 | 🏆 전쟁 승리: {row['war_wins'] or 0}회",
+            ephemeral=True,
+        )
+    @discord.ui.button(label="⚔️ 길드 전쟁", style=discord.ButtonStyle.danger)
+    async def guild_war(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if not p.guild_id:
+            await i.response.send_message("길드에 가입되어 있지 않습니다.", ephemeral=True)
+            return
+        war = await get_active_war(p.guild_id)
+        if war:
+            txt = f"**⚔️ {war['guild_a']} vs {war['guild_b']}**\n📊 {war['score_a']:,} : {war['score_b']:,}\n종료: <t:{int(datetime.fromisoformat(war['ends_at']).timestamp())}:R>"
+        else:
+            txt = "현재 진행 중인 길드 전쟁이 없습니다. 길드장이라면 아래에서 선전포고할 수 있습니다."
+        await i.response.send_message(txt, view=GuildWarView(self.uid, p.guild_id), ephemeral=True)
+
+
+class GuildWarDeclareModal(discord.ui.Modal, title="길드 전쟁 선포"):
+    target_guild = discord.ui.TextInput(label="상대 길드 이름", max_length=20)
+    def __init__(self, uid, my_guild):
+        super().__init__()
+        self.uid = uid
+        self.my_guild = my_guild
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        row = await fetch_one("SELECT owner_id FROM guilds WHERE guild_name=?", (self.my_guild,))
+        if not row or row["owner_id"] != self.uid:
+            await i.followup.send("길드장만 전쟁을 선포할 수 있습니다.", ephemeral=True)
+            return
+        ok, msg = await declare_guild_war(self.my_guild, self.target_guild.value)
+        await i.followup.send(msg, ephemeral=True)
+        if ok:
+            try:
+                await i.channel.send(msg)
+            except Exception:
+                pass
+
+
+class GuildWarView(discord.ui.View):
+    def __init__(self, uid, guild_name):
+        super().__init__(timeout=120)
+        self.uid = uid
+        self.guild_name = guild_name
+
+    @discord.ui.button(label="📯 전쟁 선포 (길드장 전용)", style=discord.ButtonStyle.danger)
+    async def declare(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.send_modal(GuildWarDeclareModal(self.uid, self.guild_name))
+
+    @discord.ui.button(label="🗡️ 전쟁 기여 (공격)", style=discord.ButtonStyle.primary)
+    async def contribute(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await contribute_war(p)
+        await i.followup.send(msg, ephemeral=True)
+
+
+class NPCView(discord.ui.View):
+    def __init__(self, cog, uid, npc_key, npc):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.uid = uid
+        self.npc = npc
+        if npc.get("quests"):
+            btn = discord.ui.Button(label="📜 퀘스트", style=discord.ButtonStyle.primary)
+            btn.callback = self.show_quests
+            self.add_item(btn)
+        if "enchant" in npc.get("services", []):
+            btn = discord.ui.Button(label="💎 강화", style=discord.ButtonStyle.primary)
+            btn.callback = self.do_enchant
+            self.add_item(btn)
+        if "craft" in npc.get("services", []):
+            btn = discord.ui.Button(label="⚒️ 제작", style=discord.ButtonStyle.success)
+            btn.callback = self.show_craft
+            self.add_item(btn)
+        if "guild" in npc.get("services", []):
+            btn = discord.ui.Button(label="🏰 길드", style=discord.ButtonStyle.secondary)
+            btn.callback = self.show_guild
+            self.add_item(btn)
+        if "pvp" in npc.get("services", []):
+            btn = discord.ui.Button(label="⚔️ PVP", style=discord.ButtonStyle.danger)
+            btn.callback = self.show_pvp
+            self.add_item(btn)
+        if npc.get("shop_items"):
+            btn = discord.ui.Button(label="🛒 상점", style=discord.ButtonStyle.success)
+            btn.callback = self.show_shop
+            self.add_item(btn)
+    async def show_quests(self, i: discord.Interaction):
+        if i.user.id == self.uid:
+            quests = self.npc.get("quests", [])
+            lines = ["**📜 퀘스트 목록**"] + [f"• **{QUEST_DATA.get(qc,{}).get('name',qc)}**: {QUEST_DATA.get(qc,{}).get('desc','')}" for qc in quests]
+            await i.response.send_message("\n".join(lines), view=QuestListView(None, self.uid, quests), ephemeral=True)
+    async def do_enchant(self, i: discord.Interaction):
+        if i.user.id != self.uid:
+            return
+        rows = await fetch_all("SELECT * FROM inventory_items WHERE user_id=? AND item_type IN ('무기','방어구') LIMIT 5", (self.uid,))
+        if not rows:
+            await i.response.send_message("강화할 장비가 없습니다.", ephemeral=True)
+            return
+        await i.response.send_message("💎 강화할 아이템을 선택하세요:", view=EnchantSelectView(None, self.uid, rows), ephemeral=True)
+    async def show_craft(self, i: discord.Interaction):
+        if i.user.id != self.uid:
+            return
+        lines = ["**⚒️ 제작 목록**"]
+        for code, recipe in CRAFT_RECIPES.items():
+            item = ITEM_CATALOG.get(code)
+            if item:
+                mats = ", ".join(f"{ITEM_CATALOG.get(k, Item(k,k,'','')).name} x{v}" for k, v in recipe["재료"].items())
+                lines.append(f"• **{item.name}**: {mats} + 💰{recipe['코인']:,}")
+        await i.response.send_message("\n".join(lines), view=CraftView(None, self.uid), ephemeral=True)
+    async def show_guild(self, i: discord.Interaction):
+        if i.user.id == self.uid:
+            await i.response.send_message("🏰 길드 메뉴", view=GuildView(None, self.uid), ephemeral=True)
+    async def show_pvp(self, i: discord.Interaction):
+        if i.user.id == self.uid:
+            await i.response.send_message("⚔️ PVP 메뉴", view=PVPMenuView(self.cog, self.uid), ephemeral=True)
+    async def show_shop(self, i: discord.Interaction):
+        if i.user.id == self.uid:
+            shop_items = self.npc.get("shop_items", [])
+            lines = ["**🛒 상점**"]
+            for code in shop_items:
+                if code in ITEM_CATALOG:
+                    lines.append(f"• {ITEM_CATALOG[code].name}: 💰 {SHOP_ITEMS.get(code,{}).get('price',0):,}")
+            await i.response.send_message("\n".join(lines), view=ShopView(None, self.uid, shop_items), ephemeral=True)
+
+
+class MinigameView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=120)
+        self.uid = uid
+    @discord.ui.button(label="🎣 낚시", style=discord.ButtonStyle.primary)
+    async def fishing(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        msg = await start_fishing(self.uid)
+        await i.response.send_message(msg, view=FishingReactView(None, self.uid), ephemeral=True)
+    @discord.ui.button(label="🎰 슬롯머신", style=discord.ButtonStyle.danger)
+    async def slots(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(SlotBetModal(self.uid))
+    @discord.ui.button(label="🎲 주사위", style=discord.ButtonStyle.secondary)
+    async def dice(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id == self.uid:
+            await i.response.send_modal(DiceModal(self.uid))
+
+
+class FishingReactView(discord.ui.View):
+    def __init__(self, cog, uid):
+        super().__init__(timeout=15)
+        self.uid = uid
+    @discord.ui.button(label="🎣 낚아채기!", style=discord.ButtonStyle.success)
+    async def catch(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.uid:
+            return
+        await i.response.defer(ephemeral=True)
+        ok, msg = await catch_fish(self.uid)
+        await i.followup.send(msg, ephemeral=True)
+        self.stop()
+
+
+class SlotBetModal(discord.ui.Modal, title="슬롯머신 베팅"):
+    bet = discord.ui.TextInput(label="베팅 코인", min_length=1, max_length=8)
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            bet = int(self.bet.value)
+        except ValueError:
+            await i.followup.send("올바른 숫자를 입력하세요.", ephemeral=True)
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await play_slots(p, bet)
+        await i.followup.send(msg, ephemeral=True)
+
+
+class DiceModal(discord.ui.Modal, title="주사위 도박"):
+    bet = discord.ui.TextInput(label="베팅 코인", min_length=1, max_length=8)
+    guess = discord.ui.TextInput(label="예측 숫자 (1~6)", min_length=1, max_length=1)
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        try:
+            bet = int(self.bet.value)
+            guess = int(self.guess.value)
+        except ValueError:
+            await i.followup.send("올바른 숫자를 입력하세요.", ephemeral=True)
+            return
+        p = await ensure_player(i.user.id, i.user.display_name)
+        ok, msg = await play_dice(p, bet, guess)
+        await i.followup.send(msg, ephemeral=True)
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 확인 / 수락 View
+# ═══════════════════════════════════════════════════════════════════════
+class MarriageConfirmView(discord.ui.View):
+    def __init__(self, proposer_id: int, target_id: int):
+        super().__init__(timeout=120)
+        self.proposer_id = proposer_id
+        self.target_id = target_id
+
+    @discord.ui.button(label="💍 수락", style=discord.ButtonStyle.success)
+    async def accept(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.target_id:
+            await i.response.send_message("이 요청의 대상이 아닙니다.", ephemeral=True)
+            return
+        await i.response.defer()
+        msg = await confirm_marriage(self.proposer_id, self.target_id)
+        await i.followup.send(msg)
+        self.stop()
+
+    @discord.ui.button(label="❌ 거절", style=discord.ButtonStyle.danger)
+    async def reject(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.target_id:
+            await i.response.send_message("이 요청의 대상이 아닙니다.", ephemeral=True)
+            return
+        await i.response.send_message("💔 결혼 제안을 거절했습니다.")
+        self.stop()
+
+
+class BrotherhoodConfirmView(discord.ui.View):
+    def __init__(self, proposer_id: int, target_id: int):
+        super().__init__(timeout=120)
+        self.proposer_id = proposer_id
+        self.target_id = target_id
+
+    @discord.ui.button(label="🤝 수락", style=discord.ButtonStyle.success)
+    async def accept(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.target_id:
+            await i.response.send_message("이 요청의 대상이 아닙니다.", ephemeral=True)
+            return
+        await i.response.defer()
+        msg = await confirm_brotherhood(self.proposer_id, self.target_id)
+        await i.followup.send(msg)
+        self.stop()
+
+    @discord.ui.button(label="❌ 거절", style=discord.ButtonStyle.danger)
+    async def reject(self, i: discord.Interaction, b: discord.ui.Button):
+        if i.user.id != self.target_id:
+            await i.response.send_message("이 요청의 대상이 아닙니다.", ephemeral=True)
+            return
+        await i.response.send_message("❌ 의형제 제안을 거절했습니다.")
+        self.stop()
+
+
+class TeachJobConfirmView(discord.ui.View):
+    def __init__(self, cog, request_id: str):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.request_id = request_id
+
+    @discord.ui.button(label="🎓 전직 전수 승인", style=discord.ButtonStyle.success)
+    async def accept(self, i: discord.Interaction, b: discord.ui.Button):
+        req = self.cog._teach_requests.get(self.request_id)
+        if not req:
+            await i.response.send_message("요청이 만료되었거나 존재하지 않습니다.", ephemeral=True)
+            return
+        if i.user.id != req["teacher_id"]:
+            await i.response.send_message("스승만 승인할 수 있습니다.", ephemeral=True)
+            return
+        await i.response.defer()
+        student_row = await fetch_one("SELECT * FROM players WHERE user_id=?", (req["student_id"],))
+        if not student_row:
+            await i.followup.send("제자를 찾을 수 없습니다.", ephemeral=True)
+            self.cog._teach_requests.pop(self.request_id, None)
+            self.stop()
+            return
+        student = PlayerRecord.from_row(student_row)
+        ok, reason = check_job_requirements(student, req["job"])
+        if not ok:
+            await i.followup.send(f"제자가 아직 조건을 충족하지 못했습니다: {reason}", ephemeral=True)
+            return
+        ok2, msg = await apply_job_change(student, req["job"], learned_from=req["teacher_id"])
+        self.cog._teach_requests.pop(self.request_id, None)
+        self.stop()
+        await i.followup.send(f"✅ 전수 완료: {msg}")
+
+    @discord.ui.button(label="❌ 전수 거절", style=discord.ButtonStyle.danger)
+    async def reject(self, i: discord.Interaction, b: discord.ui.Button):
+        req = self.cog._teach_requests.get(self.request_id)
+        if not req:
+            await i.response.send_message("요청이 이미 처리되었습니다.", ephemeral=True)
+            return
+        if i.user.id != req["teacher_id"]:
+            await i.response.send_message("스승만 거절할 수 있습니다.", ephemeral=True)
+            return
+        self.cog._teach_requests.pop(self.request_id, None)
+        self.stop()
+        await i.response.send_message("전직 전수를 거절했습니다.")
+
+
+class PVPConfirmView(discord.ui.View):
+    def __init__(self, cog, request_id: str):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.request_id = request_id
+
+    @discord.ui.button(label="⚔️ 결투 수락", style=discord.ButtonStyle.success)
+    async def accept(self, i: discord.Interaction, b: discord.ui.Button):
+        req = self.cog._pvp_requests.get(self.request_id)
+        if not req:
+            await i.response.send_message("PVP 요청이 만료되었거나 존재하지 않습니다.", ephemeral=True)
+            return
+        if i.user.id != req["target_id"]:
+            await i.response.send_message("도전 받은 플레이어만 수락할 수 있습니다.", ephemeral=True)
+            return
+        await i.response.defer()
+        p1 = await ensure_player(req["challenger_id"], f"User-{req['challenger_id']}")
+        p2 = await ensure_player(req["target_id"], i.user.display_name)
+        result = await fight_pvp(p1, p2)
+        self.cog._pvp_requests.pop(self.request_id, None)
+        self.stop()
+        await i.followup.send(result["log"])
+
+    @discord.ui.button(label="❌ 결투 거절", style=discord.ButtonStyle.danger)
+    async def reject(self, i: discord.Interaction, b: discord.ui.Button):
+        req = self.cog._pvp_requests.get(self.request_id)
+        if not req:
+            await i.response.send_message("PVP 요청이 이미 처리되었습니다.", ephemeral=True)
+            return
+        if i.user.id != req["target_id"]:
+            await i.response.send_message("도전 받은 플레이어만 거절할 수 있습니다.", ephemeral=True)
+            return
+        self.cog._pvp_requests.pop(self.request_id, None)
+        self.stop()
+        await i.response.send_message("⚠️ PVP 도전을 거절했습니다.")
+
+
+
+# 시스템 함수 (크래프팅, 스킬, 세트효과, 월드보스, 길드전쟁)
+# ═══════════════════════════════════════════════════════════════════════
+
+async def calculate_set_bonus(p: PlayerRecord) -> dict:
+    """장착한 아이템들의 세트효과를 계산합니다."""
+    bonus = {"attack": 0, "defense": 0, "max_hp": 0, "max_mp": 0, "crit": 0, "desc": ""}
+    equipment = uj(p.equipment_json)
+    set_counts = {}
+    for slot_name, item_code in equipment.items():
+        if item_code and item_code in ITEM_CATALOG:
+            meta = ITEM_CATALOG[item_code].meta
+            if "set" in meta:
+                set_name = meta["set"]
+                set_counts[set_name] = set_counts.get(set_name, 0) + 1
+    for set_name, count in set_counts.items():
+        if set_name in ITEM_SETS:
+            set_data = ITEM_SETS[set_name]
+            for req_count in sorted(set_data["bonus"].keys(), reverse=True):
+                if count >= req_count:
+                    b = set_data["bonus"][req_count]
+                    for stat_key, val in b.items():
+                        if stat_key != "desc":
+                            bonus[stat_key] = bonus.get(stat_key, 0) + val
+                    if "desc" in b and not bonus["desc"]:
+                        bonus["desc"] = b["desc"]
+                    break
+    return bonus
+
+async def try_craft(p: PlayerRecord, recipe_id: str) -> Tuple[bool, str]:
+    """아이템 제작을 시도합니다."""
+    if recipe_id not in CRAFT_RECIPES:
+        return False, "존재하지 않는 레시피입니다."
+    if recipe_id not in ITEM_CATALOG:
+        return False, "제작할 수 없는 아이템입니다."
+    recipe = CRAFT_RECIPES[recipe_id]
+    mats_needed = recipe.get("재료", {})
+    coins_needed = recipe.get("코인", 0)
+    
+    if p.coins < coins_needed:
+        return False, f"💰 코인이 부족합니다. (필요: {coins_needed}, 보유: {p.coins})"
+    
+    inv_items = await fetch_all("SELECT item_code, qty FROM inventory_items WHERE user_id=?", (p.user_id,))
+    inv = {row["item_code"]: row["qty"] for row in inv_items}
+    
+    for mat_code, qty_needed in mats_needed.items():
+        if inv.get(mat_code, 0) < qty_needed:
+            mat_name = ITEM_CATALOG.get(mat_code, Item(mat_code, mat_code, "", "일반")).name
+            return False, f"재료 부족: {mat_name} (필요: {qty_needed}, 보유: {inv.get(mat_code, 0)})"
+    
+    for mat_code, qty_needed in mats_needed.items():
+        await execute("UPDATE inventory_items SET qty=qty-? WHERE user_id=? AND item_code=?", (qty_needed, p.user_id, mat_code))
+    
+    await execute("UPDATE players SET coins=coins-? WHERE user_id=?", (coins_needed, p.user_id))
+    item = ITEM_CATALOG[recipe_id]
+    await execute("INSERT INTO inventory_items (user_id,item_code,item_name,item_type,rarity,qty,power,defense,meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+        (p.user_id, recipe_id, item.name, item.item_type, item.rarity, 1, item.power, item.defense, j(item.meta)))
+    
+    await execute("UPDATE players SET crafting_exp=crafting_exp+50 WHERE user_id=?", (p.user_id,))
+    return True, f"✅ {item.name}을(를) 제작했습니다!"
+
+async def try_use_skill(p: PlayerRecord, job: str, skill_id: str, target_hp: int, target_atk: int, target_def: int) -> Tuple[float, str]:
+    """스킬을 사용합니다. (데미지 배수 반환)"""
+    if job not in SKILL_TREE or skill_id not in SKILL_TREE[job]:
+        return 0, "사용할 수 없는 스킬입니다."
+    skill = SKILL_TREE[job][skill_id]
+    if p.mp < skill.get("mp", 0):
+        return 0, f"💧 MP가 부족합니다. (필요: {skill.get('mp', 0)})"
+    
+    await execute("UPDATE players SET mp=mp-? WHERE user_id=?", (skill.get("mp", 0), p.user_id))
+    mult = skill.get("mult", 1.0)
+    desc = f"🎯 {skill['name']} 시전! ({mult}배 데미지)"
+    return mult, desc
+
+async def join_world_boss(p: PlayerRecord, boss_idx: int) -> Tuple[bool, str]:
+    """월드보스 레이드에 참여합니다."""
+    if boss_idx >= len(WORLD_BOSSES):
+        return False, "존재하지 않는 보스입니다."
+    boss = WORLD_BOSSES[boss_idx]
+    raid_id = f"wb_{int(time.time())}_{random.randint(1000, 9999)}"
+    
+    await execute("INSERT INTO raid_sessions (raid_id,boss_name,boss_hp,boss_max_hp,is_world,participants_json) VALUES (?,?,?,?,?,?)",
+        (raid_id, boss["name"], boss["hp"], boss["hp"], 1, j({str(p.user_id): {"damage": 0}})))
+    
+    return True, f"⚔️ {boss['name']} 월드보스 전투에 참여했습니다!"
+
+async def declare_guild_war(guild_a: str, guild_b: str) -> Tuple[bool, str]:
+    """길드 전쟁을 선포합니다."""
+    g_a = await fetch_one("SELECT * FROM guilds WHERE guild_name=?", (guild_a,))
+    g_b = await fetch_one("SELECT * FROM guilds WHERE guild_name=?", (guild_b,))
+    if not g_a or not g_b:
+        return False, "존재하지 않는 길드입니다."
+    
+    war_id = uuid.uuid4().hex[:8]
+    end_time = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    await execute("INSERT INTO guild_wars (war_id,guild_a,guild_b,ends_at) VALUES (?,?,?,?)", (war_id, guild_a, guild_b, end_time))
+    return True, f"⚔️ {guild_a} vs {guild_b} 길드전이 시작되었습니다!"
+
+# ═══════════════════════════════════════════════════════════════════════
+# 코그 / 명령어 / 이벤트
+# ═══════════════════════════════════════════════════════════════════════
+class RPGCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._teach_requests: Dict[str, dict] = {}
+        self._pvp_requests: Dict[str, dict] = {}
+        self._quiz_active: Dict[str, dict] = {}
+
+    def _is_dev(self, uid: int) -> bool:
+        return uid in settings.dev_ids
+
+    async def broadcast_global_chat(self, message: discord.Message):
+        rows = await fetch_all("SELECT guild_id, channel_id FROM global_chat_channels")
+        p = await ensure_player(message.author.id, message.author.display_name)
+        title_str = f"[{p.title}] " if p.title else ""
+        embed = discord.Embed(
+            description=message.content,
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(name=f"{title_str}{p.username} (Lv.{p.level})", icon_url=message.author.display_avatar.url)
+        embed.set_footer(text=f"서버: {message.guild.name if message.guild else 'DM'}")
+        for r in rows:
+            if r["channel_id"] == str(message.channel.id):
+                continue
+            ch = self.bot.get_channel(int(r["channel_id"]))
+            if ch:
+                try:
+                    await ch.send(embed=embed)
+                except Exception:
+                    pass
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+        if message.guild:
+            row = await fetch_one(
+                "SELECT channel_id FROM global_chat_channels WHERE guild_id=?",
+                (str(message.guild.id),),
+            )
+            if row and str(message.channel.id) == row["channel_id"]:
+                await self.broadcast_global_chat(message)
+        ch_id = str(message.channel.id)
+        quiz = self._quiz_active.get(ch_id)
+        if quiz and message.author.id not in quiz["answered"]:
+            if message.content.strip().lower() == quiz["answer"].strip().lower():
+                quiz["answered"].add(message.author.id)
+                p = await ensure_player(message.author.id, message.author.display_name)
+                p.coins += quiz["reward"]
+                await save_player(p)
+                await message.channel.send(f"🎉 **{message.author.display_name}** 정답! 💰{quiz['reward']:,}코인 획득!")
+                self._quiz_active.pop(ch_id, None)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before, after):
+        if after.channel and len(after.channel.members) >= 2:
+            p = await ensure_player(member.id, member.display_name)
+            p.voice_bonus_until = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            await save_player(p)
+
+    @app_commands.command(name="rpg", description="RPG 자판기를 열고 개인 게임 창을 시작합니다")
+    async def rpg(self, i: discord.Interaction):
+        kiosk = (
+            "```\n"
+            "╔════════════════ 🎮 RPG 자판기 ════════════════╗\n"
+            "║ A1 게임 시작   A2 전체 랭킹                  ║\n"
+            "║ B1 PVP 킬보드  B2 도움말                    ║\n"
+            "║ C1 초대        C2 버그 제보                 ║\n"
+            "╚══════════════════════════════════════════════╝\n"
+            "```\n"
+            "버튼은 모두에게 보이지만, 실제 RPG 플레이 화면은 버튼을 누른 본인에게만 비공개로 열립니다."
+        )
+        await i.response.send_message(kiosk, view=RPGLobbyView(self), ephemeral=False)
+
+    @app_commands.command(name="글로벌채팅설정", description="(관리자) 현재 채널을 글로벌 채팅 채널로 설정")
+    @app_commands.default_permissions(administrator=True)
+    async def set_global_chat(self, i: discord.Interaction):
+        await execute(
+            "INSERT OR REPLACE INTO global_chat_channels (guild_id, channel_id) VALUES (?,?)",
+            (str(i.guild_id) if i.guild_id else "DM", str(i.channel_id)),
+        )
+        await i.response.send_message("✅ 이 채널이 글로벌 채팅 채널로 설정되었습니다!", ephemeral=True)
+
+    @app_commands.command(name="퀴즈", description="(관리자) OX/주관식 퀴즈 이벤트 시작")
+    @app_commands.default_permissions(administrator=True)
+    async def quiz_event(self, i: discord.Interaction, 문제: str, 정답: str, 보상코인: int = 100):
+        ch_id = str(i.channel_id)
+        self._quiz_active[ch_id] = {"answer": 정답, "reward": 보상코인, "answered": set()}
+        await i.response.send_message(
+            f"**❓ 퀴즈 이벤트!**\n{문제}\n\n먼저 정답을 입력하면 💰{보상코인:,}코인을 획득합니다!"
+        )
+
+    @app_commands.command(name="공지", description="[DEV] 공지 브로드캐스트")
+    async def announce(self, i: discord.Interaction, 내용: str):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        await i.response.defer(ephemeral=True)
+        sent = 0
+        for ch_id in settings.announce_channel_ids:
+            ch = self.bot.get_channel(ch_id)
+            if ch:
+                try:
+                    await ch.send(f"📢 **공지사항**\n{내용}")
+                    sent += 1
+                except Exception:
+                    pass
+        await i.followup.send(f"✅ {sent}개 채널에 공지를 전송했습니다.", ephemeral=True)
+
+    @app_commands.command(name="dev_give_item", description="[DEV] 아이템 지급")
+    async def dev_give_item(self, i: discord.Interaction, 유저: discord.User, 아이템코드: str, 수량: int = 1):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        item = ITEM_CATALOG.get(아이템코드)
+        if not item:
+            matches = [code for code, it in ITEM_CATALOG.items() if 아이템코드.lower() in code.lower() or 아이템코드.lower() in it.name.lower()]
+            if matches:
+                아이템코드 = matches[0]
+                item = ITEM_CATALOG[아이템코드]
+        if not item:
+            await i.response.send_message(f"❌ 아이템 '{아이템코드}'를 찾을 수 없습니다.", ephemeral=True)
+            return
+        ok = await add_item(유저.id, 아이템코드, 수량)
+        if ok:
+            await i.response.send_message(f"✅ {유저.display_name}에게 **{item.name}** x{수량} 지급 완료.", ephemeral=True)
+        else:
+            await i.response.send_message("❌ 아이템 지급 실패.", ephemeral=True)
+
+    @app_commands.command(name="dev_give_coin", description="[DEV] 코인 지급")
+    async def dev_give_coin(self, i: discord.Interaction, 유저: discord.User, 코인: int):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (코인, 유저.id))
+        await i.response.send_message(f"✅ {유저.display_name}에게 💰{코인:,}코인 지급 완료.", ephemeral=True)
+
+    @app_commands.command(name="dev_give_gem", description="[DEV] 젬 지급")
+    async def dev_give_gem(self, i: discord.Interaction, 유저: discord.User, 젬: int):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        await execute("UPDATE players SET gems=gems+? WHERE user_id=?", (젬, 유저.id))
+        await i.response.send_message(f"✅ {유저.display_name}에게 💎{젬}젬 지급 완료.", ephemeral=True)
+
+    @app_commands.command(name="dev_item_list", description="[DEV] 아이템 목록 조회")
+    async def dev_item_list(self, i: discord.Interaction, 검색: str = ""):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        items = [(code, item) for code, item in ITEM_CATALOG.items() if not 검색 or 검색.lower() in code.lower() or 검색.lower() in item.name.lower()][:40]
+        lines = [f"**📦 아이템 목록** (검색: {검색 or '전체'})"]
+        for code, item in items:
+            lines.append(f"`{code}` {item.name} [{item.rarity}] ATK:{item.power} DEF:{item.defense}")
+        await i.response.send_message("\n".join(lines), ephemeral=True)
+
+    @app_commands.command(name="dev_admin_report", description="[DEV] 관리자 리포트")
+    async def dev_admin_report(self, i: discord.Interaction):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        total_players = await fetch_one("SELECT COUNT(*) as cnt FROM players")
+        total_items = await fetch_one("SELECT COUNT(*) as cnt FROM inventory_items")
+        total_auctions = await fetch_one("SELECT COUNT(*) as cnt FROM auction_house")
+        total_errors = await fetch_one("SELECT COUNT(*) as cnt FROM error_logs")
+        active_raids = await fetch_one("SELECT COUNT(*) as cnt FROM raid_sessions WHERE state='active'")
+        db_size = DB_PATH.stat().st_size // 1024 if DB_PATH.exists() else 0
+        report = (
+            f"**📊 관리자 리포트**\n"
+            f"총 플레이어: {total_players['cnt'] if total_players else 0}명\n"
+            f"총 아이템: {total_items['cnt'] if total_items else 0}개\n"
+            f"거래소 매물: {total_auctions['cnt'] if total_auctions else 0}개\n"
+            f"에러 로그: {total_errors['cnt'] if total_errors else 0}건\n"
+            f"활성 레이드: {active_raids['cnt'] if active_raids else 0}개\n"
+            f"DB 용량: {db_size}KB"
+        )
+        try:
+            await i.user.send(report)
+            await i.response.send_message("✅ DM으로 리포트를 전송했습니다.", ephemeral=True)
+        except Exception:
+            await i.response.send_message(report, ephemeral=True)
+
+    @app_commands.command(name="dev_reset_ranking", description="[DEV] 랭킹 초기화")
+    async def dev_reset_ranking(self, i: discord.Interaction):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        await execute("DELETE FROM rankings WHERE season != 'watch'")
+        await i.response.send_message("✅ 랭킹이 초기화되었습니다.", ephemeral=True)
+
+    @app_commands.command(name="dev_season_reset", description="[DEV] 시즌 리셋 및 배틀패스 초기화")
+    async def dev_season_reset(self, i: discord.Interaction):
+        if not self._is_dev(i.user.id):
+            await i.response.send_message("❌ 개발자 전용 명령어입니다.", ephemeral=True)
+            return
+        top_bp = await fetch_all("SELECT user_id,level FROM battlepass ORDER BY level DESC LIMIT 3")
+        rewards = [10000, 5000, 2000]
+        for idx, row in enumerate(top_bp):
+            await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (rewards[idx], row["user_id"]))
+        await execute("UPDATE battlepass SET level=0,exp=0,season=season+1")
+        await i.response.send_message(f"✅ 시즌 리셋 완료! 상위 {len(top_bp)}명에게 보상을 지급했습니다.", ephemeral=True)
+
+    @app_commands.command(name="craft", description="아이템을 제작합니다")
+    async def craft(self, i: discord.Interaction):
+        await i.response.send_message("🔨 **제작 메뉴**\n아직 구현 중입니다.", ephemeral=True)
+
+    @app_commands.command(name="skill", description="스킬을 선택하고 사용합니다")
+    async def skill(self, i: discord.Interaction):
+        p = await ensure_player(i.user.id, i.user.display_name)
+        await i.response.send_message(f"⚡ **스킬 메뉴** ({p.job})\n아직 구현 중입니다.", ephemeral=True)
+
+    @app_commands.command(name="worldboss", description="월드보스에 도전합니다")
+    async def world_boss(self, i: discord.Interaction):
+        await i.response.send_message("🌋 **월드보스 도전**\n아직 구현 중입니다.", ephemeral=True)
+
+    @app_commands.command(name="guildwar", description="길드전 메뉴")
+    async def guild_war(self, i: discord.Interaction):
+        p = await ensure_player(i.user.id, i.user.display_name)
+        if not p.guild_id:
+            await i.response.send_message("❌ 길드에 가입하지 않았습니다.", ephemeral=True)
+            return
+        await i.response.send_message("⚔️ **길드전 메뉴**\n아직 구현 중입니다.", ephemeral=True)
+
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.stamina_regen.start()
+        self.auction_expire.start()
+
+    def cog_unload(self):
+        self.stamina_regen.cancel()
+        self.auction_expire.cancel()
+
+    @tasks.loop(minutes=5)
+    async def stamina_regen(self):
+        try:
+            await execute("UPDATE players SET stamina=MIN(max_stamina, stamina+5)")
+        except Exception as e:
+            log.error(f"Stamina regen error: {e}")
+
+    @tasks.loop(hours=1)
+    async def auction_expire(self):
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            expired = await fetch_all("SELECT * FROM auction_house WHERE end_at <= ?", (now,))
+            for row in expired:
+                item_data = uj(row["item_json"])
+                if row["highest_bidder"]:
+                    await execute(
+                        "INSERT INTO inventory_items (user_id,item_code,item_name,item_type,rarity,qty,power,defense,meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (
+                            row["highest_bidder"],
+                            item_data.get("item_code", ""),
+                            item_data.get("item_name", ""),
+                            item_data.get("item_type", ""),
+                            item_data.get("rarity", "일반"),
+                            item_data.get("qty", 1),
+                            item_data.get("power", 0),
+                            item_data.get("defense", 0),
+                            j(item_data.get("meta_json", {})) if isinstance(item_data.get("meta_json"), dict) else item_data.get("meta_json", "{}"),
+                        ),
+                    )
+                    tax = int(row["current_bid"] * settings.trade_tax_percent / 100)
+                    net = row["current_bid"] - tax
+                    await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (net, row["seller_id"]))
+                else:
+                    await execute(
+                        "INSERT INTO inventory_items (user_id,item_code,item_name,item_type,rarity,qty,power,defense,meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (
+                            row["seller_id"],
+                            item_data.get("item_code", ""),
+                            item_data.get("item_name", ""),
+                            item_data.get("item_type", ""),
+                            item_data.get("rarity", "일반"),
+                            item_data.get("qty", 1),
+                            item_data.get("power", 0),
+                            item_data.get("defense", 0),
+                            j(item_data.get("meta_json", {})) if isinstance(item_data.get("meta_json"), dict) else item_data.get("meta_json", "{}"),
+                        ),
+                    )
+                await execute("DELETE FROM auction_house WHERE id=?", (row["id"],))
+        except Exception as e:
+            log.error(f"Auction expire error: {e}")
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 50가지 기능 함수 구현
+# ═══════════════════════════════════════════════════════════════════════
+
+async def allocate_stat(uid: int, stat: str, points: int) -> Tuple[bool, str]:
+    """1. 스탯 분배"""
+    if stat not in ["strength", "agility", "intelligence", "vitality", "luck"]:
+        return False, "존재하지 않는 스탯"
+    await execute(f"UPDATE players SET {stat}={stat}+?, stat_points=stat_points-? WHERE user_id=?", (points, points, uid))
+    return True, f"✅ {stat} +{points}"
+
+async def change_job(uid: int, job: str) -> Tuple[bool, str]:
+    """2. 직업 선택"""
+    if job not in JOB_CLASSES:
+        return False, "존재하지 않는 직업"
+    await execute("UPDATE players SET job=? WHERE user_id=?", (job, uid))
+    return True, f"✅ 직업 변경: {job}"
+
+async def transcend(uid: int) -> Tuple[bool, str]:
+    """3. 전직 시스템"""
+    p = await ensure_player(uid, "")
+    if p.job not in TRANSCEND_JOBS:
+        return False, "전직 불가능"
+    trans = TRANSCEND_JOBS[p.job]
+    if p.level < trans["lv"]:
+        return False, f"레벨 부족 (요구: {trans['lv']})"
+    new_job = trans["next"]
+    await execute("UPDATE players SET job=? WHERE user_id=?", (new_job, uid))
+    return True, f"🎉 전직: {new_job}"
+
+async def learn_skill(uid: int, job: str, skill_id: str) -> Tuple[bool, str]:
+    """4. 스킬 습득"""
+    if job not in SKILL_TREE or skill_id not in SKILL_TREE[job]:
+        return False, "스킬 없음"
+    skill = SKILL_TREE[job][skill_id]
+    state = uj(await fetch_one("SELECT state_json FROM players WHERE user_id=?", (uid,)))
+    if "skills" not in state:
+        state["skills"] = {}
+    state["skills"][skill_id] = {"learned": True}
+    await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), uid))
+    return True, f"✅ {skill['name']} 습득"
+
+async def unlock_trait(uid: int, trait_id: str) -> Tuple[bool, str]:
+    """5. 특성 해금"""
+    if trait_id not in TRAITS:
+        return False, "특성 없음"
+    trait = TRAITS[trait_id]
+    state = uj(await fetch_one("SELECT state_json FROM players WHERE user_id=?", (uid,)))
+    if "traits" not in state:
+        state["traits"] = {}
+    state["traits"][trait_id] = True
+    await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), uid))
+    return True, f"✅ 특성 해금: {trait['name']}"
+
+async def upgrade_equipment(uid: int, item_id: int) -> Tuple[bool, str]:
+    """6. 장비 강화"""
+    success_rate = 70
+    if random.randint(1, 100) <= success_rate:
+        await execute("UPDATE inventory_items SET power=power*1.1 WHERE id=?", (item_id,))
+        return True, "✅ 강화 성공"
+    return False, f"❌ 강화 실패 (성공율: {success_rate}%)"
+
+async def reroll_options(item_id: int) -> Tuple[bool, str]:
+    """7. 옵션 랜덤 부여"""
+    options = {
+        "crit": random.randint(1, 20),
+        "drain": random.randint(1, 10),
+        "element": random.choice(["fire", "water", "wind", "earth"]),
+    }
+    await execute("UPDATE inventory_items SET meta_json=? WHERE id=?", (j({"options": options}), item_id))
+    return True, f"✅ 새 옵션: {options}"
+
+async def save_build(uid: int, build_name: str, equipment_json: str) -> Tuple[bool, str]:
+    """8. 빌드 저장"""
+    state = uj(await fetch_one("SELECT state_json FROM players WHERE user_id=?", (uid,)))
+    if "builds" not in state:
+        state["builds"] = {}
+    state["builds"][build_name] = equipment_json
+    await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), uid))
+    return True, f"✅ 빌드 저장: {build_name}"
+
+async def start_turn_battle(uid: int, enemy_hp: int = 100, enemy_atk: int = 20) -> Tuple[float, str]:
+    """9. 턴제 전투"""
+    p = await ensure_player(uid, "")
+    dmg = max(1, (p.attack - enemy_atk // 2 + random.randint(-5, 5)))
+    return dmg, f"⚔️ 데미지: {dmg}"
+
+async def auto_battle(uid: int, turns: int = 10) -> Tuple[int, str]:
+    """10. 자동 전투"""
+    total_dmg = 0
+    for _ in range(turns):
+        p = await ensure_player(uid, "")
+        dmg = max(1, p.attack + random.randint(-5, 5))
+        total_dmg += dmg
+    return total_dmg, f"⚔️ 자동 전투: {total_dmg} 데미지"
+
+async def calc_attribute_dmg(attr_a: str, attr_b: str, base_dmg: float) -> Tuple[float, str]:
+    """11. 속성 상성"""
+    if attr_a not in ATTRIBUTE_WEAKNESS:
+        return base_dmg, ""
+    w = ATTRIBUTE_WEAKNESS[attr_a]
+    if attr_b == w["weak"]:
+        return base_dmg * 1.5, "⬆️ 약점!"
+    elif attr_b == w["resist"]:
+        return base_dmg * 0.7, "⬇️ 저항"
+    return base_dmg, ""
+
+async def apply_status(target_id: int, status: str) -> str:
+    """12. 상태이상"""
+    if status not in STATUS_EFFECTS:
+        return "상태이상 없음"
+    e = STATUS_EFFECTS[status]
+    state = uj(await fetch_one("SELECT state_json FROM players WHERE user_id=?", (target_id,)))
+    if "status" not in state:
+        state["status"] = {}
+    state["status"][status] = e["dur"]
+    await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), target_id))
+    return f"{e['emoji']} {e['name']} 적용"
+
+async def check_combo(skill_sequence: list) -> Tuple[bool, str]:
+    """13. 콤보 시스템"""
+    for combo_id, combo in COMBO_SKILLS.items():
+        if combo["skills"] == skill_sequence:
+            return True, f"🔗 콤보 발동: {combo['name']} (x{combo['bonus']})"
+    return False, "콤보 미발동"
+
+async def charge_ultimate(uid: int, amount: int) -> Tuple[bool, str]:
+    """14. 궁극기 게이지"""
+    state = uj(await fetch_one("SELECT state_json FROM players WHERE user_id=?", (uid,)))
+    if "ult_gauge" not in state:
+        state["ult_gauge"] = 0
+    state["ult_gauge"] += amount
+    if state["ult_gauge"] >= 100:
+        await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), uid))
+        return True, f"💫 궁극기 준비 완료!"
+    await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), uid))
+    return False, f"⚡ 게이지: {state['ult_gauge']}/100"
+
+async def start_party_battle(party_members: list) -> str:
+    """15. 파티 전투"""
+    return f"👥 파티 전투 시작: {len(party_members)}명"
+
+async def check_coop_skill(attacker_skill: str, supporter_skill: str) -> Tuple[bool, str]:
+    """16. 협동 스킬"""
+    coop_combos = {
+        ("s001", "s101"): 2.5,  # 파워 스트라이크 + 파이어볼
+        ("s201", "s301"): 2.0,  # 백스탭 + 힐
+    }
+    if (attacker_skill, supporter_skill) in coop_combos:
+        mult = coop_combos[(attacker_skill, supporter_skill)]
+        return True, f"🤝 협력 스킬! (x{mult})"
+    return False, ""
+
+async def start_pvp_arena(p1_id: int, p2_id: int) -> str:
+    """17. PVP 아레나"""
+    return f"⚔️ PVP 아레나: {p1_id} vs {p2_id}"
+
+async def enter_zone(uid: int, zone_id: str) -> Tuple[bool, str]:
+    """18. 지역 진입"""
+    if zone_id not in ZONES:
+        return False, "지역 없음"
+    zone = ZONES[zone_id]
+    await execute("UPDATE players SET x=?, y=? WHERE user_id=?", (random.randint(0, 200), random.randint(0, 200), uid))
+    return True, f"📍 {zone['name']}에 진입했습니다"
+
+async def enter_dungeon(uid: int, dungeon_id: str) -> Tuple[bool, str]:
+    """19. 던전 진입"""
+    if dungeon_id not in DUNGEONS:
+        return False, "던전 없음"
+    dungeon = DUNGEONS[dungeon_id]
+    p = await ensure_player(uid, "")
+    if p.level < dungeon["lv"]:
+        return False, f"레벨 부족 (요구: {dungeon['lv']})"
+    return True, f"⚔️ {dungeon['name']} 진입"
+
+async def climb_tower(uid: int, current_stage: int) -> Tuple[bool, str]:
+    """20. 무한의 탑"""
+    if current_stage >= INFINITE_TOWER["max_stage"]:
+        return False, "최고층 도달"
+    reward = int(1000 * (INFINITE_TOWER["reward_mult"] ** current_stage))
+    await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (reward, uid))
+    return True, f"🏰 {current_stage + 1}층 클리어! 보상: {reward}"
+
+async def do_daily_dungeon(uid: int, day_of_week: int) -> Tuple[bool, str]:
+    """21. 일일 던전"""
+    if day_of_week not in DAILY_DUNGEONS:
+        return False, "던전 없음"
+    dungeon = DAILY_DUNGEONS[day_of_week]
+    return True, f"✅ {dungeon['name']} 완료"
+
+async def join_world_boss_raid(uid: int, boss_id: str) -> Tuple[bool, str]:
+    """22. 월드 보스"""
+    if boss_id not in WORLD_BOSSES:
+        return False, "보스 없음"
+    boss = WORLD_BOSSES[boss_id]
+    return True, f"🌋 {boss['name']} 레이드 참여"
+
+async def get_random_event(uid: int) -> str:
+    """23. 랜덤 이벤트"""
+    events = [
+        "🎁 숨겨진 상인 발견!",
+        "⚠️ 함정 발동!",
+        "⭐ 희귀 몬스터 출현!",
+        "💎 보물 상자 발견!",
+    ]
+    return random.choice(events)
+
+async def unlock_story_zone(uid: int, quest_id: str) -> Tuple[bool, str]:
+    """24. 스토리 지역 해금"""
+    return True, f"🎬 새로운 지역이 해금되었습니다!"
+
+async def get_season_zone() -> str:
+    """25. 시즌 지역"""
+    season_areas = ["🎃 할로윈 성", "🎄 크리스마스 숲", "🌸 봄 정원"]
+    return random.choice(season_areas)
+
+async def start_main_quest(uid: int, quest_id: str) -> Tuple[bool, str]:
+    """26. 메인 퀘스트"""
+    if quest_id not in QUESTS:
+        return False, "퀘스트 없음"
+    quest = QUESTS[quest_id]
+    return True, f"📜 {quest['name']} 시작"
+
+async def start_sub_quest(uid: int, quest_id: str) -> Tuple[bool, str]:
+    """27. 서브 퀘스트"""
+    if quest_id not in QUESTS:
+        return False, "퀘스트 없음"
+    quest = QUESTS[quest_id]
+    return True, f"📝 {quest['name']} 시작"
+
+async def complete_repeatable_quest(uid: int, quest_id: str) -> Tuple[bool, str]:
+    """28. 반복 의뢰"""
+    if quest_id not in QUESTS:
+        return False, "퀘스트 없음"
+    quest = QUESTS[quest_id]
+    await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (quest["reward"], uid))
+    return True, f"✅ {quest['name']} 완료! +{quest['reward']} 골드"
+
+async def make_choice(uid: int, story_branch: int) -> str:
+    """29. 선택지 기반 스토리"""
+    branches = ["정직한 길 (경험치 +10%)", "교활한 길 (골드 +10%)"]
+    chosen = branches[story_branch % len(branches)]
+    return f"🎭 선택: {chosen}"
+
+async def increase_npc_favor(uid: int, npc_id: str, amount: int = 10) -> str:
+    """30. NPC 호감도"""
+    if npc_id not in NPC_FAVORABILITY:
+        return "NPC 없음"
+    npc = NPC_FAVORABILITY[npc_id]
+    npc["favor"] += amount
+    return f"❤️ {npc['name']} 호감도 +{amount} (현재: {npc['favor']})"
+
+async def add_currency(uid: int, currency: str, amount: int) -> str:
+    """31. 다중 화폐"""
+    if currency == "gold":
+        await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (amount, uid))
+    return f"💰 {CURRENCIES.get(currency, currency)} +{amount}"
+
+async def sell_in_market(uid: int, item_id: int, price: int) -> Tuple[bool, str]:
+    """32. 거래소"""
+    state = uj(await fetch_one("SELECT state_json FROM players WHERE user_id=?", (uid,)))
+    if "market_listings" not in state:
+        state["market_listings"] = {}
+    state["market_listings"][item_id] = price
+    await execute("UPDATE players SET state_json=? WHERE user_id=?", (j(state), uid))
+    return True, f"💼 아이템 판매 등록: {price} 골드"
+
+async def refresh_shop() -> str:
+    """33. 상점 갱신"""
+    return "🔄 상점이 갱신되었습니다!"
+
+async def buy_consumable(uid: int, item: str) -> Tuple[bool, str]:
+    """34. 소비 아이템 구매"""
+    if item not in SHOP_ITEMS:
+        return False, "아이템 없음"
+    shop_item = SHOP_ITEMS[item]
+    p = await ensure_player(uid, "")
+    if p.coins < shop_item["price"]:
+        return False, "골드 부족"
+    await execute("UPDATE players SET coins=coins-? WHERE user_id=?", (shop_item["price"], uid))
+    return True, f"✅ {shop_item['name']} 구매"
+
+async def add_to_collection(uid: int, item_id: str) -> str:
+    """35. 수집 도감"""
+    if item_id not in COLLECTION_ITEMS:
+        return "수집품 없음"
+    item = COLLECTION_ITEMS[item_id]
+    return f"📚 도감 추가: {item}"
+
+async def craft_item(uid: int, recipe_id: str) -> Tuple[bool, str]:
+    """36. 제작 시스템"""
+    if recipe_id not in CRAFTING_RECIPES:
+        return False, "레시피 없음"
+    recipe = CRAFTING_RECIPES[recipe_id]
+    return True, f"🔨 {recipe['result']} 제작 완료"
+
+async def gather_resource(uid: int, resource: str) -> str:
+    """37. 채집"""
+    if resource not in GATHERING:
+        return "자원 없음"
+    res = GATHERING[resource]
+    await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (res["reward"], uid))
+    return f"⛏️ {res['name']} 채집! +{res['reward']}"
+
+async def cook_food(uid: int, recipe: str) -> Tuple[bool, str]:
+    """38. 요리"""
+    if recipe not in COOKING:
+        return False, "요리 없음"
+    food = COOKING[recipe]
+    return True, f"🍲 {food['effect']} 요리 완성"
+
+async def summon_pet(uid: int, pet_id: str) -> Tuple[bool, str]:
+    """39. 펫 소환"""
+    if pet_id not in PETS:
+        return False, "펫 없음"
+    pet = PETS[pet_id]
+    return True, f"🐾 {pet['name']} 소환"
+
+async def build_facility(uid: int, facility: str) -> Tuple[bool, str]:
+    """40. 기지 건설"""
+    if facility not in FACILITY:
+        return False, "시설 없음"
+    fac = FACILITY[facility]
+    return True, f"🏗️ {fac['name']} 건설 완료"
+
+async def create_guild(uid: int, guild_name: str) -> Tuple[bool, str]:
+    """41. 길드 생성"""
+    await execute("INSERT INTO guilds (guild_name, leader_id, created_at) VALUES (?, ?, ?)",
+                  (guild_name, uid, datetime.now(timezone.utc).isoformat()))
+    return True, f"🏰 길드 생성: {guild_name}"
+
+async def add_achievement(uid: int, achievement_id: str) -> Tuple[bool, str]:
+    """42. 업적 달성"""
+    if achievement_id not in ACHIEVEMENT_TITLES:
+        return False, "업적 없음"
+    ach = ACHIEVEMENT_TITLES[achievement_id]
+    return True, f"🏆 업적 달성: {ach['name']}"
+
+async def add_title(uid: int, achievement_id: str) -> Tuple[bool, str]:
+    """43. 칭호 획득"""
+    if achievement_id not in ACHIEVEMENT_TITLES:
+        return False, "칭호 없음"
+    ach = ACHIEVEMENT_TITLES[achievement_id]
+    await execute("UPDATE players SET title=? WHERE user_id=?", (ach["name"], uid))
+    return True, f"👑 칭호 획득: {ach['name']}"
+
+async def toggle_pvp(uid: int, enabled: bool) -> str:
+    """44. PVP 설정"""
+    status = "🟢 ON" if enabled else "🔴 OFF"
+    await execute("UPDATE players SET pvp_enabled=? WHERE user_id=?", (1 if enabled else 0, uid))
+    return f"⚔️ PVP {status}"
+
+async def trigger_auto_refresh(uid: int) -> str:
+    """45. 자동 새로고침"""
+    return "🔄 자동 새로고침 활성화"
+
+
+class Bot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await init_db()
+        self.rpg_cog = RPGCog(self)
+        await self.add_cog(self.rpg_cog)
+        await self.add_cog(TaskCog(self))
+        await self.tree.sync()
+        log.info("✅ 봇 초기화 완료 - 명령어 동기화 완료")
+
+    async def on_ready(self):
+        log.info(f"✅ {self.user} 로그인 완료! 서버 수: {len(self.guilds)}")
+        await self.change_presence(activity=discord.Game(name="RPG 자판기 | /rpg"))
+
+    async def on_error(self, event, *args, **kwargs):
+        log.exception(f"이벤트 오류: {event}")
+
+
+bot = Bot()
+
+class TaskCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.stamina_regen.start()
+        self.auction_expire.start()
+
+    def cog_unload(self):
+        self.stamina_regen.cancel()
+        self.auction_expire.cancel()
+
+    @tasks.loop(minutes=5)
+    async def stamina_regen(self):
+        try:
+            await execute("UPDATE players SET stamina=MIN(max_stamina, stamina+5)")
+        except Exception as e:
+            log.error(f"Stamina regen error: {e}")
+
+    @tasks.loop(hours=1)
+    async def auction_expire(self):
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            expired = await fetch_all("SELECT * FROM auction_house WHERE end_at <= ?", (now,))
+            for row in expired:
+                item_data = uj(row["item_json"])
+                if row["highest_bidder"]:
+                    await execute(
+                        "INSERT INTO inventory_items (user_id,item_code,item_name,item_type,rarity,qty,power,defense,meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (row["highest_bidder"], item_data.get("item_code", ""), item_data.get("item_name", ""), item_data.get("item_type", ""), item_data.get("rarity", "일반"), item_data.get("qty", 1), item_data.get("power", 0), item_data.get("defense", 0), j(item_data.get("meta_json", {}))),
+                    )
+                    tax = int(row["current_bid"] * 5 / 100)
+                    net = row["current_bid"] - tax
+                    await execute("UPDATE players SET coins=coins+? WHERE user_id=?", (net, row["seller_id"]))
+                else:
+                    await execute(
+                        "INSERT INTO inventory_items (user_id,item_code,item_name,item_type,rarity,qty,power,defense,meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (row["seller_id"], item_data.get("item_code", ""), item_data.get("item_name", ""), item_data.get("item_type", ""), item_data.get("rarity", "일반"), item_data.get("qty", 1), item_data.get("power", 0), item_data.get("defense", 0), j(item_data.get("meta_json", {}))),
+                    )
+                await execute("DELETE FROM auction_house WHERE id=?", (row["id"],))
+        except Exception as e:
+            log.error(f"Auction expire error: {e}")
+
+class Bot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await init_db()
+        self.rpg_cog = RPGCog(self)
+        await self.add_cog(self.rpg_cog)
+        await self.add_cog(TaskCog(self))
+        await self.tree.sync()
+        log.info("✅ 봇 초기화 완료 - 명령어 동기화 완료")
+
+    async def on_ready(self):
+        log.info(f"✅ {self.user} 로그인 완료! 서버 수: {len(self.guilds)}")
+        await self.change_presence(activity=discord.Game(name="RPG 자판기 | /rpg"))
+
+    async def on_error(self, event, *args, **kwargs):
+        log.exception(f"이벤트 오류: {event}")
+
+
+bot = Bot()
+
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN", "TOKEN_HERE")
+    if token == "TOKEN_HERE":
+        log.error("❌ DISCORD_TOKEN이 설정되지 않았습니다! .env 파일을 확인하세요.")
+        sys.exit(1)
+    bot.run(token)
